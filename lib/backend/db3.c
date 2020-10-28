@@ -874,6 +874,10 @@ static int db3_dbiOpen(rpmdb rdb, rpmDbiTagVal rpmtag, dbiIndex * dbip, int flag
 		oflags &= ~DB_RDONLY;
 		dbtype = (rpmtag == RPMDBI_PACKAGES) ?  DB_HASH : DB_BTREE;
 		retry_open--;
+		if (rpmtag == RPMDBI_PACKAGES) {
+		    rpmlog(RPMLOG_WARNING,
+			    "using deprecated bdb database backend");
+		}
 	    } else {
 		retry_open = 0;
 	    }
