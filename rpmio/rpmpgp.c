@@ -515,7 +515,7 @@ pgpDigAlg pgpDigAlgFree(pgpDigAlg alg)
     return NULL;
 }
 
-static int pgpPrtSigParams(pgpTag tag, uint8_t pubkey_algo, uint8_t sigtype,
+static int pgpPrtSigParams(pgpTag tag, uint8_t pubkey_algo,
 		const uint8_t *p, const uint8_t *h, size_t hlen,
 		pgpDigParams sigp)
 {
@@ -528,10 +528,8 @@ static int pgpPrtSigParams(pgpTag tag, uint8_t pubkey_algo, uint8_t sigtype,
 	int mpil = pgpMpiLen(p);
 	if (p + mpil > pend)
 	    break;
-	if (sigtype == PGPSIGTYPE_BINARY || sigtype == PGPSIGTYPE_TEXT) {
-	    if (sigalg->setmpi(sigalg, i, p))
-		break;
-	}
+	if (sigalg->setmpi(sigalg, i, p))
+	    break;
 	p += mpil;
     }
 
@@ -604,7 +602,7 @@ static int pgpPrtSig(pgpTag tag, const uint8_t *h, size_t hlen,
 	}
 
 	p = ((uint8_t *)v) + sizeof(*v);
-	rc = pgpPrtSigParams(tag, v->pubkey_algo, v->sigtype, p, h, hlen, _digp);
+	rc = pgpPrtSigParams(tag, v->pubkey_algo, p, h, hlen, _digp);
     }	break;
     case 4:
     {   pgpPktSigV4 v = (pgpPktSigV4)h;
@@ -662,7 +660,7 @@ static int pgpPrtSig(pgpTag tag, const uint8_t *h, size_t hlen,
 	if (p > (h + hlen))
 	    return 1;
 
-	rc = pgpPrtSigParams(tag, v->pubkey_algo, v->sigtype, p, h, hlen, _digp);
+	rc = pgpPrtSigParams(tag, v->pubkey_algo, p, h, hlen, _digp);
     }	break;
     default:
 	rpmlog(RPMLOG_WARNING, _("Unsupported version of key: V%d\n"), version);
@@ -1041,36 +1039,127 @@ unsigned int pgpDigParamsAlgo(pgpDigParams digp, unsigned int algotype)
     return algo;
 }
 
+static pgpDigParams pgpDigParamsNew(uint8_t tag)
+{
+    pgpDigParams digp = xcalloc(1, sizeof(*digp));
+    digp->tag = tag;
+    return digp;
+}
+
+static int hashKey(DIGEST_CTX hash, const struct pgpPkt *pkt, int exptag)
+{
+    int rc = -1;
+    if (pkt->tag == exptag) {
+	uint8_t head[] = {
+	    0x99,
+	    (pkt->blen >> 8),
+	    (pkt->blen     ),
+	};
+
+	rpmDigestUpdate(hash, head, 3);
+	rpmDigestUpdate(hash, pkt->body, pkt->blen);
+	rc = 0;
+    }
+    return rc;
+}
+
+static int pgpVerifySelf(pgpDigParams key, pgpDigParams selfsig,
+			const struct pgpPkt *all, int i)
+{
+    int rc = -1;
+    DIGEST_CTX hash = NULL;
+
+    switch (selfsig->sigtype) {
+    case PGPSIGTYPE_SUBKEY_BINDING:
+	hash = rpmDigestInit(selfsig->hash_algo, 0);
+	if (hash) {
+	    rc = hashKey(hash, &all[0], PGPTAG_PUBLIC_KEY);
+	    if (!rc)
+		rc = hashKey(hash, &all[i-1], PGPTAG_PUBLIC_SUBKEY);
+	}
+	break;
+    default:
+	/* ignore types we can't handle */
+	rc = 0;
+	break;
+    }
+
+    if (hash && rc == 0)
+	rc = pgpVerifySignature(key, selfsig, hash);
+
+    rpmDigestFinal(hash, NULL, NULL, 0);
+
+    return rc;
+}
+
 int pgpPrtParams(const uint8_t * pkts, size_t pktlen, unsigned int pkttype,
 		 pgpDigParams * ret)
 {
     const uint8_t *p = pkts;
     const uint8_t *pend = pkts + pktlen;
     pgpDigParams digp = NULL;
-    struct pgpPkt pkt;
+    pgpDigParams selfsig = NULL;
+    int i = 0;
+    int alloced = 16; /* plenty for normal cases */
+    struct pgpPkt *all = xmalloc(alloced * sizeof(*all));
     int rc = -1; /* assume failure */
+    int expect = 0;
+    int prevtag = 0;
 
     while (p < pend) {
-	if (decodePkt(p, (pend - p), &pkt))
+	struct pgpPkt *pkt = &all[i];
+	if (decodePkt(p, (pend - p), pkt))
 	    break;
 
 	if (digp == NULL) {
-	    if (pkttype && pkt.tag != pkttype) {
+	    if (pkttype && pkt->tag != pkttype) {
 		break;
 	    } else {
-		digp = xcalloc(1, sizeof(*digp));
-		digp->tag = pkt.tag;
+		digp = pgpDigParamsNew(pkt->tag);
 	    }
 	}
 
-	if (pgpPrtPkt(&pkt, digp))
+	if (expect) {
+	    if (pkt->tag != expect)
+		break;
+	    selfsig = pgpDigParamsNew(pkt->tag);
+	}
+
+	if (pgpPrtPkt(pkt, selfsig ? selfsig : digp))
 	    break;
 
-	p += (pkt.body - pkt.head) + pkt.blen;
+	if (selfsig) {
+	    /* subkeys must be followed by binding signature */
+	    int xx = 1; /* assume failure */
+
+	    if (!(prevtag == PGPTAG_PUBLIC_SUBKEY &&
+		  selfsig->sigtype != PGPSIGTYPE_SUBKEY_BINDING))
+		xx = pgpVerifySelf(digp, selfsig, all, i);
+
+	    selfsig = pgpDigParamsFree(selfsig);
+	    if (xx)
+		break;
+	    expect = 0;
+	}
+
+	if (pkt->tag == PGPTAG_PUBLIC_SUBKEY)
+	    expect = PGPTAG_SIGNATURE;
+	prevtag = pkt->tag;
+
+	i++;
+	p += (pkt->body - pkt->head) + pkt->blen;
+	if (pkttype == PGPTAG_SIGNATURE)
+	    break;
+
+	if (alloced <= i) {
+	    alloced *= 2;
+	    all = xrealloc(all, alloced * sizeof(*all));
+	}
     }
 
-    rc = (digp && (p == pend)) ? 0 : -1;
+    rc = (digp && (p == pend) && expect == 0) ? 0 : -1;
 
+    free(all);
     if (ret && rc == 0) {
 	*ret = digp;
     } else {
@@ -1105,8 +1194,7 @@ int pgpPrtParamsSubkeys(const uint8_t *pkts, size_t pktlen,
 		digps = xrealloc(digps, alloced * sizeof(*digps));
 	    }
 
-	    digps[count] = xcalloc(1, sizeof(**digps));
-	    digps[count]->tag = PGPTAG_PUBLIC_SUBKEY;
+	    digps[count] = pgpDigParamsNew(PGPTAG_PUBLIC_SUBKEY);
 	    /* Copy UID from main key to subkey */
 	    digps[count]->userid = xstrdup(mainkey->userid);
 
