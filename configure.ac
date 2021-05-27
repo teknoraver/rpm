@@ -113,6 +113,7 @@ AC_PATH_PROG(__NM, nm, /usr/bin/nm, $MYPATH)
 AC_PATH_PROG(__OBJCOPY, objcopy, /usr/bin/objcopy, $MYPATH)
 AC_PATH_PROG(__OBJDUMP, objdump, /usr/bin/objdump, $MYPATH)
 AC_PATH_PROG(__STRIP, strip, /usr/bin/strip, $MYPATH)
+AC_PATH_PROG(__FIND_DEBUGINFO, find-debuginfo, /usr/bin/find-debuginfo, $MYPATH)
 
 AC_PATH_PROG(__GIT, git, /usr/bin/git, $MYPATH)
 AC_PATH_PROG(__HG, hg, /usr/bin/hg, $MYPATH)
