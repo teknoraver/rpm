@@ -101,6 +101,7 @@ enum rpmQVSources_e {
     RPMQV_SPECBUILTRPMS,	/*!< ... from pkgs which would be built from spec */
     RPMQV_WHATOBSOLETES,	/*!< ... from obsoletes db search. */
     RPMQV_WHATCONFLICTS,	/*!< ... from conflicts db search. */
+    RPMQV_PATH_ALL,	/*!< ... from file path db search (all states). */
 };
 
 typedef rpmFlags rpmQVSources;
