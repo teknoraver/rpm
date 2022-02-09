@@ -54,6 +54,9 @@ struct rpmfi_s {
     int intervalStart;		/*!< Start of iterating interval. */
     int intervalEnd;		/*!< End of iterating interval. */
 
+    rpmfiChdirCb onChdir;	/*!< Callback for directory changes */
+    void *onChdirData;		/*!< Caller private callback data */
+
     rpmfiles files;		/*!< File info set */
     rpmcpio_t archive;		/*!< Archive with payload */
     unsigned char * found;	/*!< Bit field of files found in the archive */
@@ -299,11 +302,16 @@ rpm_count_t rpmfiDC(rpmfi fi)
     return (fi != NULL ? rpmfilesDC(fi->files) : 0);
 }
 
-#ifdef	NOTYET
-int rpmfiDI(rpmfi fi)
+int rpmfiSetOnChdir(rpmfi fi, rpmfiChdirCb cb, void *data)
 {
+    int rc = -1;
+    if (fi != NULL) {
+	fi->onChdir = cb;
+	fi->onChdirData = data;
+	rc = 0;
+    }
+    return rc;
 }
-#endif
 
 int rpmfiFX(rpmfi fi)
 {
@@ -315,9 +323,17 @@ int rpmfiSetFX(rpmfi fi, int fx)
     int i = -1;
 
     if (fi != NULL && fx >= 0 && fx < rpmfilesFC(fi->files)) {
+	int dx = fi->j;
 	i = fi->i;
 	fi->i = fx;
 	fi->j = rpmfilesDI(fi->files, fi->i);
+	i = fi->i;
+
+	if (fi->j != dx && fi->onChdir) {
+	    int chrc = fi->onChdir(fi, fi->onChdirData);
+	    if (chrc < 0)
+		i = chrc;
+	}
     }
     return i;
 }
@@ -1723,9 +1739,9 @@ static rpmfi initIter(rpmfiles files, int itype, int link)
     if (files && itype>=0 && itype<=RPMFILEITERMAX) {
 	fi = xcalloc(1, sizeof(*fi)); 
 	fi->i = -1;
+	fi->j = -1;
 	fi->files = link ? rpmfilesLink(files) : files;
 	fi->next = nextfuncs[itype];
-	fi->i = -1;
 	if (itype == RPMFI_ITER_BACK) {
 	    fi->i = rpmfilesFC(fi->files);
 	} else if (itype >=RPMFI_ITER_READ_ARCHIVE
