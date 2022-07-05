@@ -8,6 +8,7 @@ Source: hello-2.0.tar.gz
 Patch1: hello-1.0-modernize.patch
 Group: Testing
 License: GPLv2+
+SourceLicense: GPL, ASL 1.0
 BuildArch: noarch
 
 %description

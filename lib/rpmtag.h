@@ -375,6 +375,9 @@ typedef enum rpmTag_e {
     RPMTAG_MODULARITYLABEL	= 5096, /* s */
     RPMTAG_PAYLOADDIGESTALT	= 5097, /* s[] */
 
+    /* Backports */
+    RPMTAG_SOURCELICENSE	= 5102, /* internal */
+
     RPMTAG_FIRSTFREE_TAG	/*!< internal */
 } rpmTag;
 
