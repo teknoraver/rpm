@@ -1166,6 +1166,7 @@ static char * mireDup(rpmTagVal tag, rpmMireMode *modep,
 	    case '.':
 	    case '+':
 	    case '*':
+	    case '^':
 		if (!brackets) nb++;
 		break;
 	    case '\\':
