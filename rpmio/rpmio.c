@@ -1073,6 +1073,7 @@ static rpmzstd rpmzstdNew(int fdno, const char *fmode)
     char *t = stdio;
     char *te = t + sizeof(stdio) - 2;
     int c;
+    int threads = 0;
 
     switch ((c = *s++)) {
     case 'a':
@@ -1101,7 +1102,14 @@ static rpmzstd rpmzstdNew(int fdno, const char *fmode)
 	    flags &= ~O_ACCMODE;
 	    flags |= O_RDWR;
 	    continue;
-	    break;
+	case 'T':
+	    if (*s >= '0' && *s <= '9') {
+		threads = strtol(s, (char **)&s, 10);
+		/* T0 means automatic detection */
+		if (threads == 0)
+		    threads = sysconf(_SC_NPROCESSORS_ONLN);
+	    }
+	    continue;
 	default:
 	    if (c >= (int)'0' && c <= (int)'9') {
 		level = strtol(s-1, (char **)&s, 10);
@@ -1135,11 +1143,17 @@ static rpmzstd rpmzstdNew(int fdno, const char *fmode)
 	}
 	nb = ZSTD_DStreamInSize();
     } else {					/* compressing */
-	if ((_stream = (void *) ZSTD_createCStream()) == NULL
-	 || ZSTD_isError(ZSTD_initCStream(_stream, level))) {
+	if ((_stream = (void *) ZSTD_createCCtx()) == NULL
+	 || ZSTD_isError(ZSTD_CCtx_setParameter(_stream, ZSTD_c_compressionLevel, level))) {
 	    goto err;
 	}
-	nb = ZSTD_CStreamOutSize();
+
+        rpmlog(RPMLOG_DEBUG, "using %i threads in zstd compression\n", threads);
+        if (threads > 0) {
+            if (ZSTD_isError (ZSTD_CCtx_setParameter(_stream, ZSTD_c_nbWorkers, threads)))
+            rpmlog(RPMLOG_WARNING, "zstd library does not support multi-threading\n");
+	}
+ 	nb = ZSTD_CStreamOutSize();
     }
 
     rpmzstd zstd = (rpmzstd) xcalloc(1, sizeof(*zstd));
@@ -1158,7 +1172,7 @@ err:
     if ((flags & O_ACCMODE) == O_RDONLY)
 	ZSTD_freeDStream(_stream);
     else
-	ZSTD_freeCStream(_stream);
+	ZSTD_freeCCtx(_stream);
     return NULL;
 }
 
@@ -1184,16 +1198,24 @@ assert(zstd);
 	rc = 0;
     } else {					/* compressing */
 	/* close frame */
-	zstd->zob.dst  = zstd->b;
-	zstd->zob.size = zstd->nb;
-	zstd->zob.pos  = 0;
-	int xx = ZSTD_flushStream(zstd->_stream, &zstd->zob);
-	if (ZSTD_isError(xx))
-	    fps->errcookie = ZSTD_getErrorName(xx);
-	else if (zstd->zob.pos != fwrite(zstd->b, 1, zstd->zob.pos, zstd->fp))
-	    fps->errcookie = "zstdFlush fwrite failed.";
-	else
-	    rc = 0;
+	int xx;
+	do {
+	  ZSTD_inBuffer zib = { NULL, 0, 0 };
+	  zstd->zob.dst  = zstd->b;
+	  zstd->zob.size = zstd->nb;
+	  zstd->zob.pos  = 0;
+	  xx = ZSTD_compressStream2(zstd->_stream, &zstd->zob, &zib, ZSTD_e_flush);
+	  if (ZSTD_isError(xx)) {
+	      fps->errcookie = ZSTD_getErrorName(xx);
+	      break;
+	  }
+	  else if (zstd->zob.pos != fwrite(zstd->b, 1, zstd->zob.pos, zstd->fp)) {
+	      fps->errcookie = "zstdClose fwrite failed.";
+	      break;
+	  }
+	  else
+	      rc = 0;
+	} while (xx != 0);
     }
     return rc;
 }
@@ -1238,7 +1260,7 @@ assert(zstd);
 	zstd->zob.pos  = 0;
 
 	/* Compress next chunk. */
-        int xx = ZSTD_compressStream(zstd->_stream, &zstd->zob, &zib);
+        int xx = ZSTD_compressStream2(zstd->_stream, &zstd->zob, &zib, ZSTD_e_continue);
         if (ZSTD_isError(xx)) {
 	    fps->errcookie = ZSTD_getErrorName(xx);
 	    return -1;
@@ -1267,17 +1289,25 @@ assert(zstd);
 	ZSTD_freeDStream(zstd->_stream);
     } else {					/* compressing */
 	/* close frame */
-	zstd->zob.dst  = zstd->b;
-	zstd->zob.size = zstd->nb;
-	zstd->zob.pos  = 0;
-	int xx = ZSTD_endStream(zstd->_stream, &zstd->zob);
-	if (ZSTD_isError(xx))
-	    fps->errcookie = ZSTD_getErrorName(xx);
-	else if (zstd->zob.pos != fwrite(zstd->b, 1, zstd->zob.pos, zstd->fp))
-	    fps->errcookie = "zstdClose fwrite failed.";
-	else
-	    rc = 0;
-	ZSTD_freeCStream(zstd->_stream);
+	int xx;
+	do {
+	  ZSTD_inBuffer zib = { NULL, 0, 0 };
+	  zstd->zob.dst  = zstd->b;
+	  zstd->zob.size = zstd->nb;
+	  zstd->zob.pos  = 0;
+	  xx = ZSTD_compressStream2(zstd->_stream, &zstd->zob, &zib, ZSTD_e_end);
+	  if (ZSTD_isError(xx)) {
+	      fps->errcookie = ZSTD_getErrorName(xx);
+	      break;
+	  }
+	  else if (zstd->zob.pos != fwrite(zstd->b, 1, zstd->zob.pos, zstd->fp)) {
+	      fps->errcookie = "zstdClose fwrite failed.";
+	      break;
+	  }
+	  else
+	      rc = 0;
+	} while (xx != 0);
+	ZSTD_freeCCtx(zstd->_stream);
     }
 
     if (zstd->fp && fileno(zstd->fp) > 2)
