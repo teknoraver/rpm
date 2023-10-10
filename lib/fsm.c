@@ -5,9 +5,11 @@
 
 #include "system.h"
 
+#include <inttypes.h>
 #include <utime.h>
 #include <errno.h>
-#if WITH_CAP
+#include <fcntl.h>
+#ifdef WITH_CAP
 #include <sys/capability.h>
 #endif
 
@@ -17,10 +19,11 @@
 #include <rpm/rpmmacro.h>
 
 #include "rpmio/rpmio_internal.h"	/* fdInit/FiniDigest */
-#include "lib/fsm.h"
-#include "lib/rpmte_internal.h"	/* XXX rpmfs */
-#include "lib/rpmplugins.h"	/* rpm plugins hooks */
-#include "lib/rpmug.h"
+#include "fsm.h"
+#include "rpmte_internal.h"	/* XXX rpmfs */
+#include "rpmfi_internal.h" /* rpmfiSetOnChdir */
+#include "rpmplugins.h"	/* rpm plugins hooks */
+#include "rpmug.h"
 
 #include "debug.h"
 
@@ -38,172 +41,92 @@ static int strict_erasures = 0;
 #define _dirPerms 0755
 #define _filePerms 0644
 
+enum filestage_e {
+    FILE_COMMIT = -1,
+    FILE_NONE   = 0,
+    FILE_PRE    = 1,
+    FILE_UNPACK = 2,
+    FILE_PREP   = 3,
+    FILE_POST   = 4,
+};
+
+struct filedata_s {
+    int stage;
+    int setmeta;
+    int skip;
+    rpmFileAction action;
+    const char *suffix;
+    char *fpath;
+    struct stat sb;
+};
+
 /* 
  * XXX Forward declarations for previously exported functions to avoid moving 
  * things around needlessly 
  */ 
 static const char * fileActionString(rpmFileAction a);
+static int fsmOpenat(int dirfd, const char *path, int flags, int dir);
+static int fsmClose(int *wfdp);
 
 /** \ingroup payload
  * Build path to file from file info, optionally ornamented with suffix.
+ * "/" needs special handling to avoid appearing as empty path.
  * @param fi		file info iterator
  * @param suffix	suffix to use (NULL disables)
- * @retval		path to file (malloced)
+ * @param[out]		path to file (malloced)
  */
 static char * fsmFsPath(rpmfi fi, const char * suffix)
 {
-    return rstrscat(NULL, rpmfiDN(fi), rpmfiBN(fi), suffix ? suffix : "", NULL);
+    const char *bn = rpmfiBN(fi);
+    return rstrscat(NULL, *bn ? bn : "/", suffix ? suffix : "", NULL);
 }
 
-/** \ingroup payload
- * Directory name iterator.
- */
-typedef struct dnli_s {
-    rpmfiles fi;
-    char * active;
-    int reverse;
-    int isave;
-    int i;
-} * DNLI_t;
-
-/** \ingroup payload
- * Destroy directory name iterator.
- * @param dnli		directory name iterator
- * @retval		NULL always
- */
-static DNLI_t dnlFreeIterator(DNLI_t dnli)
+static int fsmLink(int odirfd, const char *opath, int dirfd, const char *path)
 {
-    if (dnli) {
-	if (dnli->active) free(dnli->active);
-	free(dnli);
+    int rc = linkat(odirfd, opath, dirfd, path, 0);
+
+    if (_fsm_debug) {
+	rpmlog(RPMLOG_DEBUG, " %8s (%d %s, %d %s) %s\n", __func__,
+	       odirfd, opath, dirfd, path, (rc < 0 ? strerror(errno) : ""));
     }
-    return NULL;
+
+    if (rc < 0)
+	rc = RPMERR_LINK_FAILED;
+    return rc;
 }
 
-/** \ingroup payload
- * Create directory name iterator.
- * @param fi		file info set
- * @param fs		file state set
- * @param reverse	traverse directory names in reverse order?
- * @return		directory name iterator
- */
-static DNLI_t dnlInitIterator(rpmfiles fi, rpmfs fs, int reverse)
+#ifdef WITH_CAP
+static int cap_set_fileat(int dirfd, const char *path, cap_t fcaps)
 {
-    DNLI_t dnli;
-    int i, j;
-    int dc;
-
-    if (fi == NULL)
-	return NULL;
-    dc = rpmfilesDC(fi);
-    dnli = xcalloc(1, sizeof(*dnli));
-    dnli->fi = fi;
-    dnli->reverse = reverse;
-    dnli->i = (reverse ? dc : 0);
-
-    if (dc) {
-	dnli->active = xcalloc(dc, sizeof(*dnli->active));
-	int fc = rpmfilesFC(fi);
-
-	/* Identify parent directories not skipped. */
-	for (i = 0; i < fc; i++)
-            if (!XFA_SKIPPING(rpmfsGetAction(fs, i)))
-		dnli->active[rpmfilesDI(fi, i)] = 1;
-
-	/* Exclude parent directories that are explicitly included. */
-	for (i = 0; i < fc; i++) {
-	    int dil;
-	    size_t dnlen, bnlen;
-
-	    if (!S_ISDIR(rpmfilesFMode(fi, i)))
-		continue;
-
-	    dil = rpmfilesDI(fi, i);
-	    dnlen = strlen(rpmfilesDN(fi, dil));
-	    bnlen = strlen(rpmfilesBN(fi, i));
-
-	    for (j = 0; j < dc; j++) {
-		const char * dnl;
-		size_t jlen;
-
-		if (!dnli->active[j] || j == dil)
-		    continue;
-		dnl = rpmfilesDN(fi, j);
-		jlen = strlen(dnl);
-		if (jlen != (dnlen+bnlen+1))
-		    continue;
-		if (!rstreqn(dnl, rpmfilesDN(fi, dil), dnlen))
-		    continue;
-		if (!rstreqn(dnl+dnlen, rpmfilesBN(fi, i), bnlen))
-		    continue;
-		if (dnl[dnlen+bnlen] != '/' || dnl[dnlen+bnlen+1] != '\0')
-		    continue;
-		/* This directory is included in the package. */
-		dnli->active[j] = 0;
-		break;
-	    }
-	}
-
-	/* Print only once per package. */
-	if (!reverse) {
-	    j = 0;
-	    for (i = 0; i < dc; i++) {
-		if (!dnli->active[i]) continue;
-		if (j == 0) {
-		    j = 1;
-		    rpmlog(RPMLOG_DEBUG,
-	"========== Directories not explicitly included in package:\n");
-		}
-		rpmlog(RPMLOG_DEBUG, "%10d %s\n", i, rpmfilesDN(fi, i));
-	    }
-	    if (j)
-		rpmlog(RPMLOG_DEBUG, "==========\n");
-	}
+    int rc = -1;
+    int fd = fsmOpenat(dirfd, path, O_RDONLY|O_NOFOLLOW, 0);
+    if (fd >= 0) {
+	rc = cap_set_fd(fd, fcaps);
+	fsmClose(&fd);
     }
-    return dnli;
+    return rc;
 }
+#endif
 
-/** \ingroup payload
- * Return next directory name (from file info).
- * @param dnli		directory name iterator
- * @return		next directory name
- */
-static
-const char * dnlNextIterator(DNLI_t dnli)
-{
-    const char * dn = NULL;
-
-    if (dnli) {
-	rpmfiles fi = dnli->fi;
-	int dc = rpmfilesDC(fi);
-	int i = -1;
-
-	if (dnli->active)
-	do {
-	    i = (!dnli->reverse ? dnli->i++ : --dnli->i);
-	} while (i >= 0 && i < dc && !dnli->active[i]);
-
-	if (i >= 0 && i < dc)
-	    dn = rpmfilesDN(fi, i);
-	else
-	    i = -1;
-	dnli->isave = i;
-    }
-    return dn;
-}
-
-static int fsmSetFCaps(const char *path, const char *captxt)
+static int fsmSetFCaps(int fd, int dirfd, const char *path, const char *captxt)
 {
     int rc = 0;
-#if WITH_CAP
+
+#ifdef WITH_CAP
     if (captxt && *captxt != '\0') {
 	cap_t fcaps = cap_from_text(captxt);
-	if (fcaps == NULL || cap_set_file(path, fcaps) != 0) {
-	    rc = RPMERR_SETCAP_FAILED;
+
+	if (fd >= 0) {
+	    if (fcaps == NULL || cap_set_fd(fd, fcaps))
+		rc = RPMERR_SETCAP_FAILED;
+	} else {
+	    if (fcaps == NULL || cap_set_fileat(dirfd, path, fcaps))
+		rc = RPMERR_SETCAP_FAILED;
 	}
+
 	if (_fsm_debug) {
-	    rpmlog(RPMLOG_DEBUG, " %8s (%s, %s) %s\n", __func__,
-		   path, captxt, (rc < 0 ? strerror(errno) : ""));
+	    rpmlog(RPMLOG_DEBUG, " %8s (%d - %d %s, %s) %s\n", __func__,
+		   fd, dirfd, path, captxt, (rc < 0 ? strerror(errno) : ""));
 	}
 	cap_free(fcaps);
     } 
@@ -211,101 +134,104 @@ static int fsmSetFCaps(const char *path, const char *captxt)
     return rc;
 }
 
-static void wfd_close(FD_t *wfdp)
+static int fsmClose(int *wfdp)
 {
-    if (wfdp && *wfdp) {
+    int rc = 0;
+    if (wfdp && *wfdp >= 0) {
 	int myerrno = errno;
 	static int oneshot = 0;
 	static int flush_io = 0;
+	int fdno = *wfdp;
+
 	if (!oneshot) {
 	    flush_io = (rpmExpandNumeric("%{?_flush_io}") > 0);
 	    oneshot = 1;
 	}
 	if (flush_io) {
-	    int fdno = Fileno(*wfdp);
 	    fsync(fdno);
 	}
-	Fclose(*wfdp);
-	*wfdp = NULL;
+	if (close(fdno))
+	    rc = RPMERR_CLOSE_FAILED;
+
+	if (_fsm_debug) {
+	    rpmlog(RPMLOG_DEBUG, " %8s ([%d]) %s\n", __func__,
+		   fdno, (rc < 0 ? strerror(errno) : ""));
+	}
+	*wfdp = -1;
 	errno = myerrno;
     }
+    return rc;
 }
 
-static int wfd_open(FD_t *wfdp, const char *dest)
+static int fsmOpen(int *wfdp, int dirfd, const char *dest)
 {
     int rc = 0;
     /* Create the file with 0200 permissions (write by owner). */
-    {
-	mode_t old_umask = umask(0577);
-	*wfdp = Fopen(dest, "wx.ufdio");
-	umask(old_umask);
-    }
-    if (Ferror(*wfdp)) {
+    int fd = openat(dirfd, dest, O_WRONLY|O_EXCL|O_CREAT, 0200);
+
+    if (fd < 0)
 	rc = RPMERR_OPEN_FAILED;
-	goto exit;
+
+    if (_fsm_debug) {
+	rpmlog(RPMLOG_DEBUG, " %8s (%s [%d]) %s\n", __func__,
+	       dest, fd, (rc < 0 ? strerror(errno) : ""));
     }
+    *wfdp = fd;
 
-    return 0;
-
-exit:
-    wfd_close(wfdp);
     return rc;
 }
 
-/** \ingroup payload
- * Create file from payload stream.
- * @return		0 on success
- */
-static int expandRegular(rpmfi fi, const char *dest, rpmpsm psm, int nodigest)
+static int fsmUnpack(rpmfi fi, int fdno, rpmpsm psm, int nodigest)
 {
-    FD_t wfd = NULL;
-    int rc;
-
-    rc = wfd_open(&wfd, dest);
-    if (rc != 0)
-        goto exit;
-
-    rc = rpmfiArchiveReadToFilePsm(fi, wfd, nodigest, psm);
-    wfd_close(&wfd);
-exit:
+    FD_t fd = fdDup(fdno);
+    int rc = rpmfiArchiveReadToFilePsm(fi, fd, nodigest, psm);
+    if (_fsm_debug) {
+	rpmlog(RPMLOG_DEBUG, " %8s (%s %" PRIu64 " bytes [%d]) %s\n", __func__,
+	       rpmfiFN(fi), rpmfiFSize(fi), Fileno(fd),
+	       (rc < 0 ? strerror(errno) : ""));
+    }
+    Fclose(fd);
     return rc;
 }
 
-static int fsmMkfile(rpmfi fi, const char *dest, rpmfiles files,
-		     rpmpsm psm, int nodigest, int *setmeta,
-		     int * firsthardlink, FD_t *firstlinkfile)
+static int fsmMkfile(int dirfd, rpmfi fi, struct filedata_s *fp, rpmfiles files,
+		     rpmpsm psm, int nodigest,
+		     struct filedata_s ** firstlink, int *firstlinkfile,
+		     int *firstdir, int *fdp)
 {
     int rc = 0;
-    int numHardlinks = rpmfiFNlink(fi);
+    int fd = -1;
 
-    if (numHardlinks > 1) {
-	/* Create first hardlinked file empty */
-	if (*firsthardlink < 0) {
-	    *firsthardlink = rpmfiFX(fi);
-	    rc = wfd_open(firstlinkfile, dest);
-	} else {
-	    /* Create hard links for others */
-	    char *fn = rpmfilesFN(files, *firsthardlink);
-	    rc = link(fn, dest);
-	    if (rc < 0) {
-		rc = RPMERR_LINK_FAILED;
-	    }
-	    free(fn);
+    if (*firstlink == NULL) {
+	/* First encounter, open file for writing */
+	rc = fsmOpen(&fd, dirfd, fp->fpath);
+	/* If it's a part of a hardlinked set, the content may come later */
+	if (fp->sb.st_nlink > 1) {
+	    *firstlink = fp;
+	    *firstlinkfile = fd;
+	    *firstdir = dup(dirfd);
+	}
+    } else {
+	/* Create hard links for others and avoid redundant metadata setting */
+	if (*firstlink != fp) {
+	    rc = fsmLink(*firstdir, (*firstlink)->fpath, dirfd, fp->fpath);
+	}
+	fd = *firstlinkfile;
+    }
+
+    /* If the file has content, unpack it */
+    if (rpmfiArchiveHasContent(fi)) {
+	if (!rc)
+	    rc = fsmUnpack(fi, fd, psm, nodigest);
+	/* Last file of hardlink set, ensure metadata gets set */
+	if (*firstlink) {
+	    fp->setmeta = 1;
+	    *firstlink = NULL;
+	    *firstlinkfile = -1;
+	    fsmClose(firstdir);
 	}
     }
-    /* Write normal files or fill the last hardlinked (already
-       existing) file with content */
-    if (numHardlinks<=1) {
-	if (!rc)
-	    rc = expandRegular(fi, dest, psm, nodigest);
-    } else if (rpmfiArchiveHasContent(fi)) {
-	if (!rc)
-	    rc = rpmfiArchiveReadToFilePsm(fi, *firstlinkfile, nodigest, psm);
-	wfd_close(firstlinkfile);
-	*firsthardlink = -1;
-    } else {
-	*setmeta = 0;
-    }
+    *fdp = fd;
 
     return rc;
 }
@@ -330,18 +256,15 @@ static int fsmReadLink(const char *path,
     return rc;
 }
 
-static int fsmStat(const char *path, int dolstat, struct stat *sb)
+static int fsmStat(int dirfd, const char *path, int dolstat, struct stat *sb)
 {
-    int rc;
-    if (dolstat){
-	rc = lstat(path, sb);
-    } else {
-        rc = stat(path, sb);
-    }
+    int flags = dolstat ? AT_SYMLINK_NOFOLLOW : 0;
+    int rc = fstatat(dirfd, path, sb, flags);
+
     if (_fsm_debug && rc && errno != ENOENT)
-        rpmlog(RPMLOG_DEBUG, " %8s (%s, ost) %s\n",
+        rpmlog(RPMLOG_DEBUG, " %8s (%d %s, ost) %s\n",
                __func__,
-               path, (rc < 0 ? strerror(errno) : ""));
+               dirfd, path, (rc < 0 ? strerror(errno) : ""));
     if (rc < 0) {
         rc = (errno == ENOENT ? RPMERR_ENOENT : RPMERR_LSTAT_FAILED);
 	/* Ensure consistent struct content on failure */
@@ -350,12 +273,12 @@ static int fsmStat(const char *path, int dolstat, struct stat *sb)
     return rc;
 }
 
-static int fsmRmdir(const char *path)
+static int fsmRmdir(int dirfd, const char *path)
 {
-    int rc = rmdir(path);
+    int rc = unlinkat(dirfd, path, AT_REMOVEDIR);
     if (_fsm_debug)
-	rpmlog(RPMLOG_DEBUG, " %8s (%s) %s\n", __func__,
-	       path, (rc < 0 ? strerror(errno) : ""));
+	rpmlog(RPMLOG_DEBUG, " %8s (%d %s) %s\n", __func__,
+	       dirfd, path, (rc < 0 ? strerror(errno) : ""));
     if (rc < 0)
 	switch (errno) {
 	case ENOENT:        rc = RPMERR_ENOENT;    break;
@@ -365,24 +288,156 @@ static int fsmRmdir(const char *path)
     return rc;
 }
 
-static int fsmMkdir(const char *path, mode_t mode)
+static int fsmMkdir(int dirfd, const char *path, mode_t mode)
 {
-    int rc = mkdir(path, (mode & 07777));
+    int rc = mkdirat(dirfd, path, (mode & 07777));
     if (_fsm_debug)
-	rpmlog(RPMLOG_DEBUG, " %8s (%s, 0%04o) %s\n", __func__,
-	       path, (unsigned)(mode & 07777),
+	rpmlog(RPMLOG_DEBUG, " %8s (%d %s, 0%04o) %s\n", __func__,
+	       dirfd, path, (unsigned)(mode & 07777),
 	       (rc < 0 ? strerror(errno) : ""));
     if (rc < 0)	rc = RPMERR_MKDIR_FAILED;
     return rc;
 }
 
-static int fsmMkfifo(const char *path, mode_t mode)
+static int fsmOpenat(int dirfd, const char *path, int flags, int dir)
 {
-    int rc = mkfifo(path, (mode & 07777));
+    struct stat lsb, sb;
+    int sflags = flags | O_NOFOLLOW;
+    int fd = openat(dirfd, path, sflags);
+
+    /*
+     * Only ever follow symlinks by root or target owner. Since we can't
+     * open the symlink itself, the order matters: we stat the link *after*
+     * opening the target, and if the link ownership changed between the calls
+     * it could've only been the link owner or root.
+     */
+    if (fd < 0 && errno == ELOOP && flags != sflags) {
+	int ffd = openat(dirfd, path, flags);
+	if (ffd >= 0) {
+	    if (fstatat(dirfd, path, &lsb, AT_SYMLINK_NOFOLLOW) == 0) {
+		if (fstat(ffd, &sb) == 0) {
+		    if (lsb.st_uid == 0 || lsb.st_uid == sb.st_uid) {
+			fd = ffd;
+		    }
+		}
+	    }
+	    if (ffd != fd)
+		close(ffd);
+	}
+    }
+
+    /* O_DIRECTORY equivalent */
+    if (dir && fd >= 0 && fstat(fd, &sb) == 0 && !S_ISDIR(sb.st_mode)) {
+	errno = ENOTDIR;
+	fsmClose(&fd);
+    }
+    return fd;
+}
+
+static int fsmDoMkDir(rpmPlugins plugins, int dirfd, const char *dn,
+			const char *apath,
+			int owned, mode_t mode, int *fdp)
+{
+    int rc;
+    rpmFsmOp op = (FA_CREATE);
+    if (!owned)
+	op |= FAF_UNOWNED;
+
+    /* Run fsm file pre hook for all plugins */
+    rc = rpmpluginsCallFsmFilePre(plugins, NULL, apath, mode, op);
+
+    if (!rc)
+	rc = fsmMkdir(dirfd, dn, mode);
+
+    if (!rc) {
+	*fdp = fsmOpenat(dirfd, dn, O_RDONLY|O_NOFOLLOW, 1);
+	if (*fdp == -1)
+	    rc = RPMERR_ENOTDIR;
+    }
+
+    if (!rc) {
+	rc = rpmpluginsCallFsmFilePrepare(plugins, NULL, *fdp, apath, apath, mode, op);
+    }
+
+    /* Run fsm file post hook for all plugins */
+    rpmpluginsCallFsmFilePost(plugins, NULL, apath, mode, op, rc);
+
+    if (!rc) {
+	rpmlog(RPMLOG_DEBUG,
+		"%s directory created with perms %04o\n",
+		apath, (unsigned)(mode & 07777));
+    }
+
+    return rc;
+}
+
+static int ensureDir(rpmPlugins plugins, const char *p, int owned, int create,
+		    int quiet, int *dirfdp)
+{
+    char *sp = NULL, *bn;
+    char *apath = NULL;
+    int oflags = O_RDONLY;
+    int rc = 0;
+
+    if (*dirfdp >= 0)
+	return rc;
+
+    int dirfd = fsmOpenat(-1, "/", oflags, 1);
+    int fd = dirfd; /* special case of "/" */
+
+    char *path = xstrdup(p);
+    char *dp = path;
+
+    while ((bn = strtok_r(dp, "/", &sp)) != NULL) {
+	fd = fsmOpenat(dirfd, bn, oflags, 1);
+	/* assemble absolute path for plugins benefit, sigh */
+	apath = rstrscat(&apath, "/", bn, NULL);
+
+	if (fd < 0 && errno == ENOENT && create) {
+	    mode_t mode = S_IFDIR | (_dirPerms & 07777);
+	    rc = fsmDoMkDir(plugins, dirfd, bn, apath, owned, mode, &fd);
+	}
+
+	fsmClose(&dirfd);
+	if (fd >= 0) {
+	    dirfd = fd;
+	} else {
+	    if (!quiet) {
+		rpmlog(RPMLOG_ERR, _("failed to open dir %s of %s: %s\n"),
+			bn, p, strerror(errno));
+	    }
+	    rc = RPMERR_OPEN_FAILED;
+	    break;
+	}
+
+	dp = NULL;
+    }
+
+    if (rc) {
+	fsmClose(&fd);
+	fsmClose(&dirfd);
+    } else {
+	rc = 0;
+    }
+    *dirfdp = dirfd;
 
     if (_fsm_debug) {
-	rpmlog(RPMLOG_DEBUG, " %8s (%s, 0%04o) %s\n",
-	       __func__, path, (unsigned)(mode & 07777),
+	rpmlog(RPMLOG_DEBUG, " %8s (%s: %d) %s\n", __func__,
+		p, dirfd, (rc < 0 ? strerror(errno) : ""));
+    }
+
+    free(path);
+    free(apath);
+    return rc;
+}
+
+static int fsmMkfifo(int dirfd, const char *path, mode_t mode)
+{
+    int rc = mkfifoat(dirfd, path, (mode & 07777));
+
+    if (_fsm_debug) {
+	rpmlog(RPMLOG_DEBUG, " %8s (%d %s, 0%04o) %s\n",
+	       __func__, dirfd, path, (unsigned)(mode & 07777),
 	       (rc < 0 ? strerror(errno) : ""));
     }
 
@@ -392,14 +447,14 @@ static int fsmMkfifo(const char *path, mode_t mode)
     return rc;
 }
 
-static int fsmMknod(const char *path, mode_t mode, dev_t dev)
+static int fsmMknod(int dirfd, const char *path, mode_t mode, dev_t dev)
 {
     /* FIX: check S_IFIFO or dev != 0 */
-    int rc = mknod(path, (mode & ~07777), dev);
+    int rc = mknodat(dirfd, path, (mode & ~07777), dev);
 
     if (_fsm_debug) {
-	rpmlog(RPMLOG_DEBUG, " %8s (%s, 0%o, 0x%x) %s\n",
-	       __func__, path, (unsigned)(mode & ~07777),
+	rpmlog(RPMLOG_DEBUG, " %8s (%d %s, 0%o, 0x%x) %s\n",
+	       __func__, dirfd, path, (unsigned)(mode & ~07777),
 	       (unsigned)dev, (rc < 0 ? strerror(errno) : ""));
     }
 
@@ -409,104 +464,18 @@ static int fsmMknod(const char *path, mode_t mode, dev_t dev)
     return rc;
 }
 
-/**
- * Create (if necessary) directories not explicitly included in package.
- * @param files		file data
- * @param fs		file states
- * @param plugins	rpm plugins handle
- * @return		0 on success
- */
-static int fsmMkdirs(rpmfiles files, rpmfs fs, rpmPlugins plugins)
-{
-    DNLI_t dnli = dnlInitIterator(files, fs, 0);
-    struct stat sb;
-    const char *dpath;
-    int rc = 0;
-    int i;
-    size_t ldnlen = 0;
-    const char * ldn = NULL;
-
-    while ((dpath = dnlNextIterator(dnli)) != NULL) {
-	size_t dnlen = strlen(dpath);
-	char * te, dn[dnlen+1];
-
-	if (dnlen <= 1)
-	    continue;
-
-	if (dnlen == ldnlen && rstreq(dpath, ldn))
-	    continue;
-
-	/* Copy as we need to modify the string */
-	(void) stpcpy(dn, dpath);
-
-	/* Assume '/' directory exists, "mkdir -p" for others if non-existent */
-	for (i = 1, te = dn + 1; *te != '\0'; te++, i++) {
-	    if (*te != '/')
-		continue;
-
-	    /* Already validated? */
-	    if (i < ldnlen &&
-		(ldn[i] == '/' || ldn[i] == '\0') && rstreqn(dn, ldn, i))
-		continue;
-
-	    /* Validate next component of path. */
-	    *te = '\0';
-	    rc = fsmStat(dn, 1, &sb); /* lstat */
-	    *te = '/';
-
-	    /* Directory already exists? */
-	    if (rc == 0 && S_ISDIR(sb.st_mode)) {
-		continue;
-	    } else if (rc == RPMERR_ENOENT) {
-		*te = '\0';
-		mode_t mode = S_IFDIR | (_dirPerms & 07777);
-		rpmFsmOp op = (FA_CREATE|FAF_UNOWNED);
-
-		/* Run fsm file pre hook for all plugins */
-		rc = rpmpluginsCallFsmFilePre(plugins, NULL, dn, mode, op);
-
-		if (!rc)
-		    rc = fsmMkdir(dn, mode);
-
-		if (!rc) {
-		    rc = rpmpluginsCallFsmFilePrepare(plugins, NULL, dn, dn,
-						      mode, op);
-		}
-
-		/* Run fsm file post hook for all plugins */
-		rpmpluginsCallFsmFilePost(plugins, NULL, dn, mode, op, rc);
-
-		if (!rc) {
-		    rpmlog(RPMLOG_DEBUG,
-			    "%s directory created with perms %04o\n",
-			    dn, (unsigned)(mode & 07777));
-		}
-		*te = '/';
-	    }
-	    if (rc)
-		break;
-	}
-	if (rc) break;
-
-	/* Save last validated path. */
-	ldn = dpath;
-	ldnlen = dnlen;
-    }
-    dnlFreeIterator(dnli);
-
-    return rc;
-}
-
-static void removeSBITS(const char *path)
+static void removeSBITS(int dirfd, const char *path)
 {
     struct stat stb;
-    if (lstat(path, &stb) == 0 && S_ISREG(stb.st_mode)) {
+    int flags = AT_SYMLINK_NOFOLLOW;
+    if (fstatat(dirfd, path, &stb, flags) == 0 && S_ISREG(stb.st_mode)) {
+    	/* We now know it's not a link so no need to worry about following */
 	if ((stb.st_mode & 06000) != 0) {
-	    (void) chmod(path, stb.st_mode & 0777);
+	    (void) fchmodat(dirfd, path, stb.st_mode & 0777, 0);
 	}
-#if WITH_CAP
+#ifdef WITH_CAP
 	if (stb.st_mode & (S_IXUSR|S_IXGRP|S_IXOTH)) {
-	    (void) cap_set_file(path, NULL);
+	    (void) cap_set_fileat(dirfd, path, NULL);
 	}
 #endif
     }
@@ -522,13 +491,13 @@ static void fsmDebug(const char *fpath, rpmFileAction action,
 	    (fpath ? fpath : ""));
 }
 
-static int fsmSymlink(const char *opath, const char *path)
+static int fsmSymlink(const char *opath, int dirfd, const char *path)
 {
-    int rc = symlink(opath, path);
+    int rc = symlinkat(opath, dirfd, path);
 
     if (_fsm_debug) {
-	rpmlog(RPMLOG_DEBUG, " %8s (%s, %s) %s\n", __func__,
-	       opath, path, (rc < 0 ? strerror(errno) : ""));
+	rpmlog(RPMLOG_DEBUG, " %8s (%s, %d %s) %s\n", __func__,
+	       opath, dirfd, path, (rc < 0 ? strerror(errno) : ""));
     }
 
     if (rc < 0)
@@ -536,96 +505,125 @@ static int fsmSymlink(const char *opath, const char *path)
     return rc;
 }
 
-static int fsmUnlink(const char *path)
+static int fsmUnlink(int dirfd, const char *path)
 {
     int rc = 0;
-    removeSBITS(path);
-    rc = unlink(path);
+    removeSBITS(dirfd, path);
+    rc = unlinkat(dirfd, path, 0);
     if (_fsm_debug)
-	rpmlog(RPMLOG_DEBUG, " %8s (%s) %s\n", __func__,
-	       path, (rc < 0 ? strerror(errno) : ""));
+	rpmlog(RPMLOG_DEBUG, " %8s (%d %s) %s\n", __func__,
+	       dirfd, path, (rc < 0 ? strerror(errno) : ""));
     if (rc < 0)
 	rc = (errno == ENOENT ? RPMERR_ENOENT : RPMERR_UNLINK_FAILED);
     return rc;
 }
 
-static int fsmRename(const char *opath, const char *path)
+static int fsmRename(int odirfd, const char *opath, int dirfd, const char *path)
 {
-    removeSBITS(path);
-    int rc = rename(opath, path);
+    removeSBITS(dirfd, path);
+    int rc = renameat(odirfd, opath, dirfd, path);
 #if defined(ETXTBSY) && defined(__HPUX__)
     /* XXX HP-UX (and other os'es) don't permit rename to busy files. */
     if (rc && errno == ETXTBSY) {
 	char *rmpath = NULL;
 	rstrscat(&rmpath, path, "-RPMDELETE", NULL);
-	rc = rename(path, rmpath);
-	if (!rc) rc = rename(opath, path);
+	/* Rename within the original directory */
+	rc = renameat(odirfd, path, odirfd, rmpath);
+	if (!rc) rc = renameat(odirfd, opath, dirfd, path);
 	free(rmpath);
     }
 #endif
     if (_fsm_debug)
-	rpmlog(RPMLOG_DEBUG, " %8s (%s, %s) %s\n", __func__,
-	       opath, path, (rc < 0 ? strerror(errno) : ""));
+	rpmlog(RPMLOG_DEBUG, " %8s (%d %s, %d %s) %s\n", __func__,
+	       odirfd, opath, dirfd, path, (rc < 0 ? strerror(errno) : ""));
     if (rc < 0)
 	rc = (errno == EISDIR ? RPMERR_EXIST_AS_DIR : RPMERR_RENAME_FAILED);
     return rc;
 }
 
-static int fsmRemove(const char *path, mode_t mode)
+static int fsmRemove(int dirfd, const char *path, mode_t mode)
 {
-    return S_ISDIR(mode) ? fsmRmdir(path) : fsmUnlink(path);
+    return S_ISDIR(mode) ? fsmRmdir(dirfd, path) : fsmUnlink(dirfd, path);
 }
 
-static int fsmChown(const char *path, mode_t mode, uid_t uid, gid_t gid)
+static int fsmChown(int fd, int dirfd, const char *path, mode_t mode, uid_t uid, gid_t gid)
 {
-    int rc = S_ISLNK(mode) ? lchown(path, uid, gid) : chown(path, uid, gid);
-    if (rc < 0) {
-	struct stat st;
-	if (lstat(path, &st) == 0 && st.st_uid == uid && st.st_gid == gid)
-	    rc = 0;
+    int rc;
+    struct stat st;
+
+    if (fd >= 0) {
+	rc = fchown(fd, uid, gid);
+	if (rc < 0) {
+	    if (fstat(fd, &st) == 0 && (st.st_uid == uid && st.st_gid == gid)) {
+		rc = 0;
+	    }
+	}
+    } else {
+	int flags = AT_SYMLINK_NOFOLLOW;
+	rc = fchownat(dirfd, path, uid, gid, flags);
+	if (rc < 0) {
+	    struct stat st;
+	    if (fstatat(dirfd, path, &st, flags) == 0 &&
+		    (st.st_uid == uid && st.st_gid == gid)) {
+		rc = 0;
+	    }
+	}
     }
-    if (_fsm_debug)
-	rpmlog(RPMLOG_DEBUG, " %8s (%s, %d, %d) %s\n", __func__,
-	       path, (int)uid, (int)gid,
+    if (_fsm_debug) {
+	rpmlog(RPMLOG_DEBUG, " %8s (%d - %d %s, %d, %d) %s\n", __func__,
+	       fd, dirfd, path, (int)uid, (int)gid,
 	       (rc < 0 ? strerror(errno) : ""));
+    }
     if (rc < 0)	rc = RPMERR_CHOWN_FAILED;
     return rc;
 }
 
-static int fsmChmod(const char *path, mode_t mode)
+static int fsmChmod(int fd, int dirfd, const char *path, mode_t mode)
 {
-    int rc = chmod(path, (mode & 07777));
-    if (rc < 0) {
-	struct stat st;
-	if (lstat(path, &st) == 0 && (st.st_mode & 07777) == (mode & 07777))
-	    rc = 0;
+    mode_t fmode = (mode & 07777);
+    int rc;
+    if (fd >= 0) {
+	rc = fchmod(fd, fmode);
+	if (rc < 0) {
+	    struct stat st;
+	    if (fstat(fd, &st) == 0 && (st.st_mode & 07777) == fmode) {
+		rc = 0;
+	    }
+	}
+    } else {
+	rc = fchmodat(dirfd, path, fmode, 0);
+	if (rc < 0) {
+	    struct stat st;
+	    if (fstatat(dirfd, path, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+		    (st.st_mode & 07777) == fmode) {
+		rc = 0;
+	    }
+	}
     }
     if (_fsm_debug)
-	rpmlog(RPMLOG_DEBUG, " %8s (%s, 0%04o) %s\n", __func__,
-	       path, (unsigned)(mode & 07777),
+	rpmlog(RPMLOG_DEBUG, " %8s (%d - %d %s, 0%04o) %s\n", __func__,
+	       fd, dirfd, path, (unsigned)(mode & 07777),
 	       (rc < 0 ? strerror(errno) : ""));
     if (rc < 0)	rc = RPMERR_CHMOD_FAILED;
     return rc;
 }
 
-static int fsmUtime(const char *path, mode_t mode, time_t mtime)
+static int fsmUtime(int fd, int dirfd, const char *path, mode_t mode, time_t mtime)
 {
     int rc = 0;
-    struct timeval stamps[2] = {
-	{ .tv_sec = mtime, .tv_usec = 0 },
-	{ .tv_sec = mtime, .tv_usec = 0 },
+    struct timespec stamps[2] = {
+	{ .tv_sec = mtime, .tv_nsec = 0 },
+	{ .tv_sec = mtime, .tv_nsec = 0 },
     };
 
-#if HAVE_LUTIMES
-    rc = lutimes(path, stamps);
-#else
-    if (!S_ISLNK(mode))
-	rc = utimes(path, stamps);
-#endif
+    if (fd >= 0)
+	rc = futimens(fd, stamps);
+    else
+	rc = utimensat(dirfd, path, stamps, AT_SYMLINK_NOFOLLOW);
     
     if (_fsm_debug)
-	rpmlog(RPMLOG_DEBUG, " %8s (%s, 0x%x) %s\n", __func__,
-	       path, (unsigned)mtime, (rc < 0 ? strerror(errno) : ""));
+	rpmlog(RPMLOG_DEBUG, " %8s (%d - %d %s, 0x%x) %s\n", __func__,
+	       fd, dirfd, path, (unsigned)mtime, (rc < 0 ? strerror(errno) : ""));
     if (rc < 0)	rc = RPMERR_UTIME_FAILED;
     /* ...but utime error is not critical for directories */
     if (rc && S_ISDIR(mode))
@@ -633,24 +631,24 @@ static int fsmUtime(const char *path, mode_t mode, time_t mtime)
     return rc;
 }
 
-static int fsmVerify(const char *path, rpmfi fi)
+static int fsmVerify(int dirfd, const char *path, rpmfi fi)
 {
     int rc;
     int saveerrno = errno;
     struct stat dsb;
     mode_t mode = rpmfiFMode(fi);
 
-    rc = fsmStat(path, 1, &dsb);
+    rc = fsmStat(dirfd, path, 1, &dsb);
     if (rc)
 	return rc;
 
     if (S_ISREG(mode)) {
 	/* HP-UX (and other os'es) don't permit unlink on busy files. */
 	char *rmpath = rstrscat(NULL, path, "-RPMDELETE", NULL);
-	rc = fsmRename(path, rmpath);
+	rc = fsmRename(dirfd, path, dirfd, rmpath);
 	/* XXX shouldn't we take unlink return code here? */
 	if (!rc)
-	    (void) fsmUnlink(rmpath);
+	    (void) fsmUnlink(dirfd, rmpath);
 	else
 	    rc = RPMERR_UNLINK_FAILED;
 	free(rmpath);
@@ -659,7 +657,7 @@ static int fsmVerify(const char *path, rpmfi fi)
         if (S_ISDIR(dsb.st_mode)) return 0;
         if (S_ISLNK(dsb.st_mode)) {
 	    uid_t luid = dsb.st_uid;
-            rc = fsmStat(path, 0, &dsb);
+            rc = fsmStat(dirfd, path, 0, &dsb);
             if (rc == RPMERR_ENOENT) rc = 0;
             if (rc) return rc;
             errno = saveerrno;
@@ -685,7 +683,7 @@ static int fsmVerify(const char *path, rpmfi fi)
         if (S_ISSOCK(dsb.st_mode)) return 0;
     }
     /* XXX shouldn't do this with commit/undo. */
-    rc = fsmUnlink(path);
+    rc = fsmUnlink(dirfd, path);
     if (rc == 0)	rc = RPMERR_ENOENT;
     return (rc ? rc : RPMERR_ENOENT);	/* XXX HACK */
 }
@@ -699,7 +697,7 @@ static int fsmVerify(const char *path, rpmfi fi)
 
 
 /* Rename pre-existing modified or unmanaged file. */
-static int fsmBackup(rpmfi fi, rpmFileAction action)
+static int fsmBackup(int dirfd, rpmfi fi, rpmFileAction action)
 {
     int rc = 0;
     const char *suffix = NULL;
@@ -720,9 +718,10 @@ static int fsmBackup(rpmfi fi, rpmFileAction action)
     if (suffix) {
 	char * opath = fsmFsPath(fi, NULL);
 	char * path = fsmFsPath(fi, suffix);
-	rc = fsmRename(opath, path);
+	rc = fsmRename(dirfd, opath, dirfd, path);
 	if (!rc) {
-	    rpmlog(RPMLOG_WARNING, _("%s saved as %s\n"), opath, path);
+	    rpmlog(RPMLOG_WARNING, _("%s%s saved as %s%s\n"),
+		   rpmfiDN(fi), opath, rpmfiDN(fi), path);
 	}
 	free(path);
 	free(opath);
@@ -730,7 +729,8 @@ static int fsmBackup(rpmfi fi, rpmFileAction action)
     return rc;
 }
 
-static int fsmSetmeta(const char *path, rpmfi fi, rpmPlugins plugins,
+static int fsmSetmeta(int fd, int dirfd, const char *path,
+		      rpmfi fi, rpmPlugins plugins,
 		      rpmFileAction action, const struct stat * st,
 		      int nofcaps)
 {
@@ -738,27 +738,28 @@ static int fsmSetmeta(const char *path, rpmfi fi, rpmPlugins plugins,
     const char *dest = rpmfiFN(fi);
 
     if (!rc && !getuid()) {
-	rc = fsmChown(path, st->st_mode, st->st_uid, st->st_gid);
+	rc = fsmChown(fd, dirfd, path, st->st_mode, st->st_uid, st->st_gid);
     }
     if (!rc && !S_ISLNK(st->st_mode)) {
-	rc = fsmChmod(path, st->st_mode);
+	rc = fsmChmod(fd, dirfd, path, st->st_mode);
     }
     /* Set file capabilities (if enabled) */
     if (!rc && !nofcaps && S_ISREG(st->st_mode) && !getuid()) {
-	rc = fsmSetFCaps(path, rpmfiFCaps(fi));
+	rc = fsmSetFCaps(fd, dirfd, path, rpmfiFCaps(fi));
     }
     if (!rc) {
-	rc = fsmUtime(path, st->st_mode, rpmfiFMtime(fi));
+	rc = fsmUtime(fd, dirfd, path, st->st_mode, rpmfiFMtime(fi));
     }
     if (!rc) {
 	rc = rpmpluginsCallFsmFilePrepare(plugins, fi,
-					  path, dest, st->st_mode, action);
+					  fd, path, dest,
+					  st->st_mode, action);
     }
 
     return rc;
 }
 
-static int fsmCommit(char **path, rpmfi fi, rpmFileAction action, const char *suffix)
+static int fsmCommit(int dirfd, char **path, rpmfi fi, rpmFileAction action, const char *suffix)
 {
     int rc = 0;
 
@@ -772,15 +773,18 @@ static int fsmCommit(char **path, rpmfi fi, rpmFileAction action, const char *su
 
 	/* Rename temporary to final file name if needed. */
 	if (dest != *path) {
-	    rc = fsmRename(*path, dest);
-	    if (!rc && nsuffix) {
-		char * opath = fsmFsPath(fi, NULL);
-		rpmlog(RPMLOG_WARNING, _("%s created as %s\n"),
-		       opath, dest);
-		free(opath);
-	    }
-	    free(*path);
-	    *path = dest;
+	    rc = fsmRename(dirfd, *path, dirfd, dest);
+	    if (!rc) {
+		if (nsuffix) {
+		    char * opath = fsmFsPath(fi, NULL);
+		    rpmlog(RPMLOG_WARNING, _("%s%s created as %s%s\n"),
+			   rpmfiDN(fi), opath, rpmfiDN(fi), dest);
+		    free(opath);
+		}
+		free(*path);
+		*path = dest;
+	    } else
+		free(dest);
 	}
     }
 
@@ -831,191 +835,277 @@ static void setFileState(rpmfs fs, int i)
     }
 }
 
+struct diriter_s {
+    int dirfd;
+    int firstdir;
+};
+
+static int onChdir(rpmfi fi, void *data)
+{
+    struct diriter_s *di = data;
+
+    fsmClose(&(di->dirfd));
+    return 0;
+}
+
+static rpmfi fsmIter(FD_t payload, rpmfiles files, rpmFileIter iter, void *data)
+{
+    rpmfi fi;
+    if (payload)
+	fi = rpmfiNewArchiveReader(payload, files, RPMFI_ITER_READ_ARCHIVE);
+    else
+	fi = rpmfilesIter(files, iter);
+    if (fi && data)
+	rpmfiSetOnChdir(fi, onChdir, data);
+    return fi;
+}
+
+static rpmfi fsmIterFini(rpmfi fi, struct diriter_s *di)
+{
+    fsmClose(&(di->dirfd));
+    fsmClose(&(di->firstdir));
+    return rpmfiFree(fi);
+}
+
 int rpmPackageFilesInstall(rpmts ts, rpmte te, rpmfiles files,
               rpmpsm psm, char ** failedFile)
 {
     FD_t payload = rpmtePayload(te);
-    rpmfi fi = rpmfiNewArchiveReader(payload, files, RPMFI_ITER_READ_ARCHIVE);
+    rpmfi fi = NULL;
     rpmfs fs = rpmteGetFileStates(te);
     rpmPlugins plugins = rpmtsPlugins(ts);
-    struct stat sb;
-    int saveerrno = errno;
     int rc = 0;
+    int fx = -1;
+    int fc = rpmfilesFC(files);
     int nodigest = (rpmtsFlags(ts) & RPMTRANS_FLAG_NOFILEDIGEST) ? 1 : 0;
     int nofcaps = (rpmtsFlags(ts) & RPMTRANS_FLAG_NOCAPS) ? 1 : 0;
-    int firsthardlink = -1;
-    FD_t firstlinkfile = NULL;
-    int skip;
-    rpmFileAction action;
+    int firstlinkfile = -1;
     char *tid = NULL;
-    const char *suffix;
-    char *fpath = NULL;
-
-    if (fi == NULL) {
-	rc = RPMERR_BAD_MAGIC;
-	goto exit;
-    }
+    struct filedata_s *fdata = xcalloc(fc, sizeof(*fdata));
+    struct filedata_s *firstlink = NULL;
+    struct diriter_s di = { -1, -1 };
 
     /* transaction id used for temporary path suffix while installing */
     rasprintf(&tid, ";%08x", (unsigned)rpmtsGetTid(ts));
 
-    /* Detect and create directories not explicitly in package. */
-    rc = fsmMkdirs(files, fs, plugins);
-
-    while (!rc) {
-	/* Read next payload header. */
-	rc = rpmfiNext(fi);
-
-	if (rc < 0) {
-	    if (rc == RPMERR_ITER_END)
-		rc = 0;
-	    break;
-	}
-
-	action = rpmfsGetAction(fs, rpmfiFX(fi));
-	skip = XFA_SKIPPING(action);
-	if (action != FA_TOUCH) {
-	    suffix = S_ISDIR(rpmfiFMode(fi)) ? NULL : tid;
-	} else {
-	    suffix = NULL;
-	}
-	fpath = fsmFsPath(fi, suffix);
+    /* Collect state data for the whole operation */
+    fi = rpmfilesIter(files, RPMFI_ITER_FWD);
+    while (!rc && (fx = rpmfiNext(fi)) >= 0) {
+	struct filedata_s *fp = &fdata[fx];
+	if (rpmfiFFlags(fi) & RPMFILE_GHOST)
+            fp->action = FA_SKIP;
+	else
+	    fp->action = rpmfsGetAction(fs, fx);
+	fp->skip = XFA_SKIPPING(fp->action);
+	if (XFA_CREATING(fp->action) && !S_ISDIR(rpmfiFMode(fi)))
+	    fp->suffix = tid;
+	fp->fpath = fsmFsPath(fi, fp->suffix);
 
 	/* Remap file perms, owner, and group. */
-	rc = rpmfiStat(fi, 1, &sb);
+	rc = rpmfiStat(fi, 1, &fp->sb);
 
-	fsmDebug(fpath, action, &sb);
+	/* Hardlinks are tricky and handled elsewhere for install */
+	fp->setmeta = (fp->skip == 0) &&
+		      (fp->sb.st_nlink == 1 || fp->action == FA_TOUCH);
 
-        /* Exit on error. */
-        if (rc)
-            break;
+	setFileState(fs, fx);
+	fsmDebug(fp->fpath, fp->action, &fp->sb);
 
-	/* Run fsm file pre hook for all plugins */
-	rc = rpmpluginsCallFsmFilePre(plugins, fi, fpath,
-				      sb.st_mode, action);
-	if (rc) {
-	    skip = 1;
-	} else {
-	    setFileState(fs, rpmfiFX(fi));
-	}
+	fp->stage = FILE_PRE;
+    }
+    fi = rpmfiFree(fi);
 
-        if (!skip) {
-	    int setmeta = 1;
+    if (rc)
+	goto exit;
+
+    fi = fsmIter(payload, files,
+		 payload ? RPMFI_ITER_READ_ARCHIVE : RPMFI_ITER_FWD, &di);
+
+    if (fi == NULL) {
+        rc = RPMERR_BAD_MAGIC;
+        goto exit;
+    }
+
+    /* Process the payload */
+    while (!rc && (fx = rpmfiNext(fi)) >= 0) {
+	struct filedata_s *fp = &fdata[fx];
+
+	/*
+	 * Tricksy case: this file is a being skipped, but it's part of
+	 * a hardlinked set and has the actual content linked with it.
+	 * Write the content to the first non-skipped file of the set
+	 * instead.
+	 */
+	if (fp->skip && firstlink && rpmfiArchiveHasContent(fi))
+	    fp = firstlink;
+
+        if (!fp->skip) {
+	    int mayopen = 0;
+	    int fd = -1;
+	    rc = ensureDir(plugins, rpmfiDN(fi), 0,
+			    (fp->action == FA_CREATE), 0, &di.dirfd);
 
 	    /* Directories replacing something need early backup */
-	    if (!suffix) {
-		rc = fsmBackup(fi, action);
+	    if (!rc && !fp->suffix && fp != firstlink) {
+		rc = fsmBackup(di.dirfd, fi, fp->action);
 	    }
+
+	    /* Run fsm file pre hook for all plugins */
+	    if (!rc)
+		rc = rpmpluginsCallFsmFilePre(plugins, fi, fp->fpath,
+					      fp->sb.st_mode, fp->action);
+	    if (rc)
+		goto setmeta; /* for error notification */
+
 	    /* Assume file does't exist when tmp suffix is in use */
-	    if (!suffix) {
-		rc = fsmVerify(fpath, fi);
+	    if (!fp->suffix) {
+		if (fp->action == FA_TOUCH) {
+		    struct stat sb;
+		    rc = fsmStat(di.dirfd, fp->fpath, 1, &sb);
+		} else {
+		    rc = fsmVerify(di.dirfd, fp->fpath, fi);
+		}
 	    } else {
 		rc = RPMERR_ENOENT;
 	    }
 
 	    /* See if the file was removed while our attention was elsewhere */
-	    if (rc == RPMERR_ENOENT && action == FA_TOUCH) {
-		rpmlog(RPMLOG_DEBUG, "file %s vanished unexpectedly\n", fpath);
-		action = FA_CREATE;
-		fsmDebug(fpath, action, &sb);
+	    if (rc == RPMERR_ENOENT && fp->action == FA_TOUCH) {
+		rpmlog(RPMLOG_DEBUG, "file %s vanished unexpectedly\n",
+			fp->fpath);
+		fp->action = FA_CREATE;
+		fsmDebug(fp->fpath, fp->action, &fp->sb);
 	    }
 
 	    /* When touching we don't need any of this... */
-	    if (action == FA_TOUCH)
-		goto touch;
+	    if (fp->action == FA_TOUCH)
+		goto setmeta;
 
-            if (S_ISREG(sb.st_mode)) {
+            if (S_ISREG(fp->sb.st_mode)) {
 		if (rc == RPMERR_ENOENT) {
-		    rc = fsmMkfile(fi, fpath, files, psm, nodigest,
-				   &setmeta, &firsthardlink, &firstlinkfile);
+		    rc = fsmMkfile(di.dirfd, fi, fp, files, psm, nodigest,
+				   &firstlink, &firstlinkfile, &di.firstdir,
+				   &fd);
 		}
-            } else if (S_ISDIR(sb.st_mode)) {
+            } else if (S_ISDIR(fp->sb.st_mode)) {
                 if (rc == RPMERR_ENOENT) {
-                    mode_t mode = sb.st_mode;
+                    mode_t mode = fp->sb.st_mode;
                     mode &= ~07777;
                     mode |=  00700;
-                    rc = fsmMkdir(fpath, mode);
+                    rc = fsmMkdir(di.dirfd, fp->fpath, mode);
                 }
-            } else if (S_ISLNK(sb.st_mode)) {
+            } else if (S_ISLNK(fp->sb.st_mode)) {
 		if (rc == RPMERR_ENOENT) {
-		    rc = fsmSymlink(rpmfiFLink(fi), fpath);
+		    rc = fsmSymlink(rpmfiFLink(fi), di.dirfd, fp->fpath);
 		}
-            } else if (S_ISFIFO(sb.st_mode)) {
+            } else if (S_ISFIFO(fp->sb.st_mode)) {
                 /* This mimics cpio S_ISSOCK() behavior but probably isn't right */
                 if (rc == RPMERR_ENOENT) {
-                    rc = fsmMkfifo(fpath, 0000);
+                    rc = fsmMkfifo(di.dirfd, fp->fpath, 0000);
                 }
-            } else if (S_ISCHR(sb.st_mode) ||
-                       S_ISBLK(sb.st_mode) ||
-                       S_ISSOCK(sb.st_mode))
+            } else if (S_ISCHR(fp->sb.st_mode) ||
+                       S_ISBLK(fp->sb.st_mode) ||
+                       S_ISSOCK(fp->sb.st_mode))
             {
                 if (rc == RPMERR_ENOENT) {
-                    rc = fsmMknod(fpath, sb.st_mode, sb.st_rdev);
+                    rc = fsmMknod(di.dirfd, fp->fpath, fp->sb.st_mode, fp->sb.st_rdev);
                 }
             } else {
                 /* XXX Special case /dev/log, which shouldn't be packaged anyways */
-                if (!IS_DEV_LOG(fpath))
+                if (!IS_DEV_LOG(fp->fpath))
                     rc = RPMERR_UNKNOWN_FILETYPE;
             }
 
-touch:
-	    /* Set permissions, timestamps etc for non-hardlink entries */
-	    if (!rc && setmeta) {
-		rc = fsmSetmeta(fpath, fi, plugins, action, &sb, nofcaps);
+setmeta:
+	    /* Special files require path-based ops */
+	    mayopen = S_ISREG(fp->sb.st_mode) || S_ISDIR(fp->sb.st_mode);
+	    if (!rc && fd == -1 && mayopen) {
+		int flags = O_RDONLY;
+		/* Only follow safe symlinks, and never on temporary files */
+		if (fp->suffix)
+		    flags |= AT_SYMLINK_NOFOLLOW;
+		fd = fsmOpenat(di.dirfd, fp->fpath, flags,
+				S_ISDIR(fp->sb.st_mode));
+		if (fd < 0)
+		    rc = RPMERR_OPEN_FAILED;
 	    }
-        } else if (firsthardlink >= 0 && rpmfiArchiveHasContent(fi)) {
-	    /* On FA_TOUCH no hardlinks are created thus this is skipped. */
-	    /* we skip the hard linked file containing the content */
-	    /* write the content to the first used instead */
-	    char *fn = rpmfilesFN(files, firsthardlink);
-	    rc = rpmfiArchiveReadToFilePsm(fi, firstlinkfile, nodigest, psm);
-	    wfd_close(&firstlinkfile);
-	    firsthardlink = -1;
-	    free(fn);
+
+	    if (!rc && fp->setmeta) {
+		rc = fsmSetmeta(fd, di.dirfd, fp->fpath,
+				fi, plugins, fp->action,
+				&fp->sb, nofcaps);
+	    }
+
+	    if (fd != firstlinkfile)
+		fsmClose(&fd);
 	}
 
-        if (rc) {
-            if (!skip) {
-                /* XXX only erase if temp fn w suffix is in use */
-                if (suffix) {
-		    (void) fsmRemove(fpath, sb.st_mode);
-                }
-                errno = saveerrno;
-            }
-        } else {
-	    /* Notify on success. */
-	    rpmpsmNotify(psm, RPMCALLBACK_INST_PROGRESS, rpmfiArchiveTell(fi));
-
-	    if (!skip) {
-		/* Backup file if needed. Directories are handled earlier */
-		if (suffix)
-		    rc = fsmBackup(fi, action);
-
-		if (!rc)
-		    rc = fsmCommit(&fpath, fi, action, suffix);
-	    }
-	}
-
+	/* Notify on success. */
 	if (rc)
-	    *failedFile = xstrdup(fpath);
+	    *failedFile = rstrscat(NULL, rpmfiDN(fi), fp->fpath, NULL);
+	else
+	    rpmpsmNotify(psm, RPMCALLBACK_INST_PROGRESS, rpmfiArchiveTell(fi));
+	fp->stage = FILE_UNPACK;
+    }
+    fi = fsmIterFini(fi, &di);
 
-	/* Run fsm file post hook for all plugins */
-	rpmpluginsCallFsmFilePost(plugins, fi, fpath,
-				  sb.st_mode, action, rc);
-	fpath = _free(fpath);
+    if (!rc && fx < 0 && fx != RPMERR_ITER_END)
+	rc = fx;
+
+    /* If all went well, commit files to final destination */
+    fi = fsmIter(NULL, files, RPMFI_ITER_FWD, &di);
+    while (!rc && (fx = rpmfiNext(fi)) >= 0) {
+	struct filedata_s *fp = &fdata[fx];
+
+	if (!fp->skip) {
+	    if (!rc)
+		rc = ensureDir(NULL, rpmfiDN(fi), 0, 0, 0, &di.dirfd);
+
+	    /* Backup file if needed. Directories are handled earlier */
+	    if (!rc && fp->suffix)
+		rc = fsmBackup(di.dirfd, fi, fp->action);
+
+	    if (!rc)
+		rc = fsmCommit(di.dirfd, &fp->fpath, fi, fp->action, fp->suffix);
+
+	    if (!rc)
+		fp->stage = FILE_COMMIT;
+	    else
+		*failedFile = rstrscat(NULL, rpmfiDN(fi), fp->fpath, NULL);
+
+	    /* Run fsm file post hook for all plugins for all processed files */
+	    rpmpluginsCallFsmFilePost(plugins, fi, fp->fpath,
+				      fp->sb.st_mode, fp->action, rc);
+	}
+    }
+    fi = fsmIterFini(fi, &di);
+
+    /* On failure, walk backwards and erase non-committed files */
+    if (rc) {
+	fi = fsmIter(NULL, files, RPMFI_ITER_BACK, &di);
+	while ((fx = rpmfiNext(fi)) >= 0) {
+	    struct filedata_s *fp = &fdata[fx];
+
+	    /* If the directory doesn't exist there's nothing to clean up */
+	    if (ensureDir(NULL, rpmfiDN(fi), 0, 0, 1, &di.dirfd))
+		continue;
+
+	    if (fp->stage > FILE_NONE && !fp->skip) {
+		(void) fsmRemove(di.dirfd, fp->fpath, fp->sb.st_mode);
+	    }
+	}
     }
 
     rpmswAdd(rpmtsOp(ts, RPMTS_OP_UNCOMPRESS), fdOp(payload, FDSTAT_READ));
     rpmswAdd(rpmtsOp(ts, RPMTS_OP_DIGEST), fdOp(payload, FDSTAT_DIGEST));
 
 exit:
-
-    /* No need to bother with close errors on read */
-    rpmfiArchiveClose(fi);
-    rpmfiFree(fi);
+    fi = fsmIterFini(fi, &di);
     Fclose(payload);
     free(tid);
-    free(fpath);
+    for (int i = 0; i < fc; i++)
+	free(fdata[i].fpath);
+    free(fdata);
 
     return rc;
 }
@@ -1024,32 +1114,42 @@ exit:
 int rpmPackageFilesRemove(rpmts ts, rpmte te, rpmfiles files,
               rpmpsm psm, char ** failedFile)
 {
-    rpmfi fi = rpmfilesIter(files, RPMFI_ITER_BACK);
+    struct diriter_s di = { -1, -1 };
+    rpmfi fi = fsmIter(NULL, files, RPMFI_ITER_BACK, &di);
     rpmfs fs = rpmteGetFileStates(te);
     rpmPlugins plugins = rpmtsPlugins(ts);
-    struct stat sb;
+    int fc = rpmfilesFC(files);
+    int fx = -1;
+    struct filedata_s *fdata = xcalloc(fc, sizeof(*fdata));
     int rc = 0;
-    char *fpath = NULL;
 
-    while (!rc && rpmfiNext(fi) >= 0) {
-	rpmFileAction action = rpmfsGetAction(fs, rpmfiFX(fi));
-	fpath = fsmFsPath(fi, NULL);
-	rc = fsmStat(fpath, 1, &sb);
+    while (!rc && (fx = rpmfiNext(fi)) >= 0) {
+	struct filedata_s *fp = &fdata[fx];
+	fp->action = rpmfsGetAction(fs, rpmfiFX(fi));
 
-	fsmDebug(fpath, action, &sb);
+	if (XFA_SKIPPING(fp->action))
+	    continue;
+
+	fp->fpath = fsmFsPath(fi, NULL);
+	/* If the directory doesn't exist there's nothing to clean up */
+	if (ensureDir(NULL, rpmfiDN(fi), 0, 0, 1, &di.dirfd))
+	    continue;
+
+	rc = fsmStat(di.dirfd, fp->fpath, 1, &fp->sb);
+
+	fsmDebug(fp->fpath, fp->action, &fp->sb);
 
 	/* Run fsm file pre hook for all plugins */
-	rc = rpmpluginsCallFsmFilePre(plugins, fi, fpath,
-				      sb.st_mode, action);
+	rc = rpmpluginsCallFsmFilePre(plugins, fi, fp->fpath,
+				      fp->sb.st_mode, fp->action);
 
-	if (!XFA_SKIPPING(action))
-	    rc = fsmBackup(fi, action);
+	rc = fsmBackup(di.dirfd, fi, fp->action);
 
         /* Remove erased files. */
-        if (action == FA_ERASE) {
+        if (fp->action == FA_ERASE) {
 	    int missingok = (rpmfiFFlags(fi) & (RPMFILE_MISSINGOK | RPMFILE_GHOST));
 
-	    rc = fsmRemove(fpath, sb.st_mode);
+	    rc = fsmRemove(di.dirfd, fp->fpath, fp->sb.st_mode);
 
 	    /*
 	     * Missing %ghost or %missingok entries are not errors.
@@ -1074,20 +1174,20 @@ int rpmPackageFilesRemove(rpmts ts, rpmte te, rpmfiles files,
 	    if (rc) {
 		int lvl = strict_erasures ? RPMLOG_ERR : RPMLOG_WARNING;
 		rpmlog(lvl, _("%s %s: remove failed: %s\n"),
-			S_ISDIR(sb.st_mode) ? _("directory") : _("file"),
-			fpath, strerror(errno));
+			S_ISDIR(fp->sb.st_mode) ? _("directory") : _("file"),
+			fp->fpath, strerror(errno));
             }
         }
 
 	/* Run fsm file post hook for all plugins */
-	rpmpluginsCallFsmFilePost(plugins, fi, fpath,
-				  sb.st_mode, action, rc);
+	rpmpluginsCallFsmFilePost(plugins, fi, fp->fpath,
+				  fp->sb.st_mode, fp->action, rc);
 
         /* XXX Failure to remove is not (yet) cause for failure. */
         if (!strict_erasures) rc = 0;
 
 	if (rc)
-	    *failedFile = xstrdup(fpath);
+	    *failedFile = rstrscat(NULL, rpmfiDN(fi), fp->fpath, NULL);
 
 	if (rc == 0) {
 	    /* Notify on success. */
@@ -1095,11 +1195,12 @@ int rpmPackageFilesRemove(rpmts ts, rpmte te, rpmfiles files,
 	    rpm_loff_t amount = rpmfiFC(fi) - rpmfiFX(fi);
 	    rpmpsmNotify(psm, RPMCALLBACK_UNINST_PROGRESS, amount);
 	}
-	fpath = _free(fpath);
     }
 
-    free(fpath);
-    rpmfiFree(fi);
+    for (int i = 0; i < fc; i++)
+	free(fdata[i].fpath);
+    free(fdata);
+    fsmIterFini(fi, &di);
 
     return rc;
 }
