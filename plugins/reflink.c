@@ -1,8 +1,11 @@
 #include "system.h"
 
+#include <unordered_map>
+
 #include <errno.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -22,14 +25,11 @@
 #include <sys/ioctl.h>
 
 /* use hash table to remember inode -> ix (for rpmfilesFN(ix)) lookups */
-#undef HASHTYPE
-#undef HTKEYTYPE
-#undef HTDATATYPE
 #define HASHTYPE inodeIndexHash
 #define HTKEYTYPE rpm_ino_t
 #define HTDATATYPE int
-#include "rpmhash.H"
-#include "rpmhash.C"
+
+using inodeIndexHash = std::unordered_map<rpm_ino_t, int>;
 
 /* We use this in find to indicate a key wasn't found. This is an
  * unrecoverable error, but we can at least show a decent error. 0 is never a
@@ -45,6 +45,8 @@
 #define MAGIC 3472329499408095051
 
 struct reflink_state_s {
+    reflink_state_s() : fundamental_block_size(0), buffer(NULL), keys(0), keysize(0),
+                        table(NULL), fd(0), files(NULL), transcoded(0) {}
     /* Stuff that's used across rpms */
     long fundamental_block_size;
     char *buffer;
@@ -61,19 +63,8 @@ struct reflink_state_s {
 
 typedef struct reflink_state_s * reflink_state;
 
-static int inodeCmp(rpm_ino_t a, rpm_ino_t b)
-{
-    return (a != b);
-}
-
-static unsigned int inodeId(rpm_ino_t a)
-{
-    /* rpm_ino_t is uint32_t so maps safely to unsigned int */
-    return (unsigned int)a;
-}
-
 static rpmRC reflink_init(rpmPlugin plugin, rpmts ts) {
-    reflink_state state = rcalloc(1, sizeof(struct reflink_state_s));
+    reflink_state state = new reflink_state_s;
 
     /* IOCTL-FICLONERANGE(2): ...Disk filesystems generally require the offset
      * and length arguments to be aligned to the fundamental block size.
@@ -82,20 +73,20 @@ static rpmRC reflink_init(rpmPlugin plugin, rpmts ts) {
      * system's page size, so we should use that.
      */
     state->fundamental_block_size = sysconf(_SC_PAGESIZE);
-    state->buffer = rcalloc(1, BUFFER_SIZE);
+    state->buffer = (char*)rcalloc(1, BUFFER_SIZE);
     rpmPluginSetData(plugin, state);
 
     return RPMRC_OK;
 }
 
 static void reflink_cleanup(rpmPlugin plugin) {
-    reflink_state state = rpmPluginGetData(plugin);
+    reflink_state state = (reflink_state)rpmPluginGetData(plugin);
     free(state->buffer);
-    free(state);
+    delete state;
 }
 
 static rpmRC reflink_psm_pre(rpmPlugin plugin, rpmte te) {
-    reflink_state state = rpmPluginGetData(plugin);
+    reflink_state state = (reflink_state)rpmPluginGetData(plugin);
     state->fd = rpmteFd(te);
     if (state->fd == 0) {
 	rpmlog(RPMLOG_DEBUG, _("reflink: fd = 0, no install\n"));
@@ -175,14 +166,12 @@ static rpmRC reflink_psm_pre(rpmPlugin plugin, rpmte te) {
 	state->table = NULL;
     } else {
 	int table_size = state->keys * (state->keysize + sizeof(rpm_loff_t));
-	state->table = rcalloc(1, table_size);
+	state->table = (unsigned char*)rcalloc(1, table_size);
 	if (Fread(state->table, table_size, 1, state->fd) != table_size) {
 	    rpmlog(RPMLOG_ERR, _("reflink: unable to read table\n"));
 	    return RPMRC_FAIL;
 	}
-	state->inodeIndexes = inodeIndexHashCreate(
-	    state->keys, inodeId, inodeCmp, NULL, NULL
-	);
+        state->inodeIndexes.reserve(state->keys);
     }
 
     /* Seek back to original location.
@@ -198,38 +187,33 @@ static rpmRC reflink_psm_pre(rpmPlugin plugin, rpmte te) {
 
 static rpmRC reflink_psm_post(rpmPlugin plugin, rpmte te, int res)
 {
-    reflink_state state = rpmPluginGetData(plugin);
+    reflink_state state = (reflink_state)rpmPluginGetData(plugin);
     state->files = rpmfilesFree(state->files);
     if (state->table) {
 	free(state->table);
 	state->table = NULL;
     }
-    if (state->inodeIndexes) {
-	inodeIndexHashFree(state->inodeIndexes);
-	state->inodeIndexes = NULL;
-    }
+    state->inodeIndexes.clear();
     return RPMRC_OK;
 }
-
 
 /* have a prototype, warnings system */
 rpm_loff_t find(const unsigned char *digest, reflink_state state);
 
+static uint32_t keysize;
+
+int cmpdigest(const void *k1, const void *k2) {
+        rpmlog(RPMLOG_DEBUG, _("reflink: cmpdigest k1=%p k2=%p\n"), k1, k2);
+        return memcmp(k1, k2, keysize);
+}
+
 rpm_loff_t find(const unsigned char *digest, reflink_state state) {
-# if defined(__GNUC__)
-    /* GCC nested function because bsearch's comparison function can't access
-     * state-keysize otherwise
-     */
-    int cmpdigest(const void *k1, const void *k2) {
-	rpmlog(RPMLOG_DEBUG, _("reflink: cmpdigest k1=%p k2=%p\n"), k1, k2);
-	return memcmp(k1, k2, state->keysize);
-    }
-# endif
     rpmlog(RPMLOG_DEBUG,
 	   _("reflink: bsearch(key=%p, base=%p, nmemb=%d, size=%lu)\n"),
 	   digest, state->table, state->keys,
 	   state->keysize + sizeof(rpm_loff_t));
-    char *entry = bsearch(digest, state->table, state->keys,
+    keysize = state->keysize;
+    char *entry = (char*)bsearch(digest, state->table, state->keys,
 			  state->keysize + sizeof(rpm_loff_t), cmpdigest);
     if (entry == NULL) {
 	return NOT_FOUND;
@@ -244,9 +228,8 @@ static rpmRC reflink_fsm_file_pre(rpmPlugin plugin, rpmfi fi, const char* path,
     struct file_clone_range fcr;
     rpm_loff_t size;
     int dst, rc;
-    int *hlix;
 
-    reflink_state state = rpmPluginGetData(plugin);
+    reflink_state state = (reflink_state)rpmPluginGetData(plugin);
     if (state->table == NULL) {
 	/* no table means rpm is not in reflink format, so leave. Now. */
 	return RPMRC_OK;
@@ -265,10 +248,11 @@ static rpmRC reflink_fsm_file_pre(rpmPlugin plugin, rpmfi fi, const char* path,
 	/* check for hard link entry in table. GetEntry overwrites hlix with
 	 * the address of the first match.
 	 */
-	if (inodeIndexHashGetEntry(state->inodeIndexes, inode, &hlix, NULL,
-	                           NULL)) {
+        auto it = state->inodeIndexes.find(inode);
+        if (it != state->inodeIndexes.end()) {
+            int hlix = it->second;
 	    /* entry is in table, use hard link */
-	    char *fn = rpmfilesFN(state->files, hlix[0]);
+	    char *fn = rpmfilesFN(state->files, hlix);
 	    if (link(fn, fullpath) != 0) {
 		rpmlog(RPMLOG_ERR,
 		       _("reflink: Unable to hard link %s -> %s due to %s\n"),
@@ -284,7 +268,7 @@ static rpmRC reflink_fsm_file_pre(rpmPlugin plugin, rpmfi fi, const char* path,
 	 */
 	if (rpmfiFNlink(fi) > 1) {
 	    /* minor optimization: only store files with more than one link */
-	    inodeIndexHashAddEntry(state->inodeIndexes, inode, rpmfiFX(fi));
+            state->inodeIndexes.insert({inode, rpmfiFX(fi)});
 	}
 	/* derived from wfd_open in fsm.c */
 	mode_t old_umask = umask(0577);

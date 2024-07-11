@@ -54,3 +54,5 @@ foreach(plugin ${plugins})
 	install(FILES macros.transaction_${plugin} DESTINATION ${RPM_MACROSDIR})
 endforeach()
 
+set (cxx_sources reflink.c)
+set_source_files_properties(${cxx_sources} PROPERTIES LANGUAGE CXX)

@@ -2,6 +2,9 @@
 
 #include "system.h"
 
+#include <set>
+#include <vector>
+
 #include <rpm/rpmlib.h>		/* rpmReadPackageFile .. */
 #include <rpm/rpmfi.h>
 #include <rpm/rpmtag.h>
@@ -23,16 +26,7 @@
 
 #include "debug.h"
 
-/* hash of void * (pointers) to file digests to offsets within output.
- * The length of the key depends on what the FILEDIGESTALGO is.
- */
-#undef HASHTYPE
-#undef HTKEYTYPE
-#undef HTDATATYPE
-#define HASHTYPE digestSet
-#define HTKEYTYPE const unsigned char *
-#include "rpmhash.H"
-#include "rpmhash.C"
+using digestSet = std::set<std::vector<unsigned char>>;
 
 /* magic value at end of file (64 bits) that indicates this is a transcoded
  * rpm.
@@ -120,26 +114,21 @@ exit:
     return rc;
 }
 
+static uint32_t diglen;
+
+static int digestSetCmp(const unsigned char * a, const unsigned char * b) {
+        return memcmp(a, b, diglen);
+}
+
+static int digestoffsetCmp(const void * a, const void * b) {
+        return digestSetCmp(
+                ((struct digestoffset *)a)->digest,
+                ((struct digestoffset *)b)->digest
+        );
+}
+
 static rpmRC process_package(FD_t fdi, FD_t validationi)
 {
-    uint32_t diglen;
-    /* GNU C extension: can use diglen from outer context */
-    int digestSetCmp(const unsigned char * a, const unsigned char * b) {
-	return memcmp(a, b, diglen);
-    }
-
-    unsigned int digestSetHash(const unsigned char * digest) {
-        /* assumes sizeof(unsigned int) < diglen */
-        return *(unsigned int *)digest;
-    }
-
-    int digestoffsetCmp(const void * a, const void * b) {
-	return digestSetCmp(
-	    ((struct digestoffset *)a)->digest,
-	    ((struct digestoffset *)b)->digest
-	);
-    }
-
     FD_t fdo;
     FD_t gzdi;
     Header h=NULL, sigh=NULL;
@@ -147,11 +136,12 @@ static rpmRC process_package(FD_t fdi, FD_t validationi)
     rpmRC rc = RPMRC_OK;
     rpm_mode_t mode;
     char *rpmio_flags = NULL, *zeros;
-    const unsigned char *digest;
     rpm_loff_t pos, size, pad, validation_pos;
     uint32_t offset_ix = 0;
     size_t len;
     int next = 0;
+    uint64_t magic = MAGIC;
+    ssize_t validation_len;
 
     fdo = fdDup(STDOUT_FILENO);
 
@@ -199,8 +189,7 @@ static rpmRC process_package(FD_t fdi, FD_t validationi)
      * now?)
      */
     diglen = (uint32_t)rpmDigestLength(rpmfiDigestAlgo(fi));
-    digestSet ds = digestSetCreate(rpmfiFC(fi), digestSetHash, digestSetCmp,
-				   NULL);
+    digestSet ds;
     struct digestoffset offsets[rpmfiFC(fi)];
     pos = RPMLEAD_SIZE + headerSizeof(sigh, HEADER_MAGIC_YES);
 
@@ -208,7 +197,7 @@ static rpmRC process_package(FD_t fdi, FD_t validationi)
     pos += pad_to(pos, 8);
     pos += headerSizeof(h, HEADER_MAGIC_YES);
 
-    zeros = xcalloc(fundamental_block_size, 1);
+    zeros = (char *)xcalloc(fundamental_block_size, 1);
 
     while (next >= 0) {
 	next = rpmfiNext(fi);
@@ -223,9 +212,9 @@ static rpmRC process_package(FD_t fdi, FD_t validationi)
 	    */
 	    continue;
 	}
-	digest = rpmfiFDigest(fi, NULL, NULL);
-	if (digestSetGetEntry(ds, digest, NULL)) {
-	    /* This specific digest has already been included, so skip it. */
+	unsigned char *digestb = (unsigned char*)rpmfiFDigest(fi, NULL, NULL);
+        std::vector<unsigned char> digest(digestb, digestb + diglen);
+        if (ds.find(digest) != ds.end()) {
 	    continue;
 	}
 	pad = pad_to(pos, fundamental_block_size);
@@ -236,12 +225,12 @@ static rpmRC process_package(FD_t fdi, FD_t validationi)
 	}
 	/* round up to next fundamental_block_size */
 	pos += pad;
-	digestSetAddEntry(ds, digest);
-	offsets[offset_ix].digest = digest;
+        ds.insert(digest);
+	offsets[offset_ix].digest = digestb;
 	offsets[offset_ix].pos = pos;
 	offset_ix++;
 	size = rpmfiFSize(fi);
-	rc = rpmfiArchiveReadToFile(fi, fdo, 0);
+	rc = (rpmRC)rpmfiArchiveReadToFile(fi, fdo, 0);
 	if (rc != RPMRC_OK) {
 	    fprintf(stderr, _("rpmfiArchiveReadToFile failed with %d\n"), rc);
 	    goto exit;
@@ -283,7 +272,7 @@ static rpmRC process_package(FD_t fdi, FD_t validationi)
 	offset_ix * (diglen + sizeof(rpm_loff_t))
     );
 
-    ssize_t validation_len = ufdCopy(validationi, fdo);
+    validation_len = ufdCopy(validationi, fdo);
     if (validation_len == -1) {
 	fprintf(stderr, _("digest table ufdCopy failed\n"));
 	rc = RPMRC_FAIL;
@@ -312,7 +301,6 @@ static rpmRC process_package(FD_t fdi, FD_t validationi)
 	rc = RPMRC_FAIL;
 	goto exit;
     }
-    uint64_t magic = MAGIC;
     len = sizeof(magic);
     if (Fwrite(&magic, len, 1, fdo) != len) {
 	fprintf(stderr, _("Unable to write magic\n"));
@@ -377,7 +365,7 @@ int main(int argc, char *argv[]) {
 	FD_t fdi = fdDup(STDIN_FILENO);
 	FD_t fdo = fdDup(mainpipefd[1]);
 	FD_t validationo = fdDup(metapipefd[1]);
-	rc = digestor(fdi, fdo, validationo, algos, argc - 1);
+	rc = (rpmRC)digestor(fdi, fdo, validationo, algos, argc - 1);
 	Fclose(validationo);
 	Fclose(fdo);
 	Fclose(fdi);
