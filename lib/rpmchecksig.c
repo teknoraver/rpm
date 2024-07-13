@@ -290,3 +290,32 @@ int rpmcliVerifySignatures(rpmts ts, ARGV_const_t argv)
     rpmKeyringFree(keyring);
     return res;
 }
+
+int rpmcliVerifySignaturesFD(rpmts ts, FD_t fdi)
+{
+    int res = 0;
+    rpmKeyring keyring = rpmtsGetKeyring(ts, 1);
+    rpmVSFlags vsflags = rpmtsVfyFlags(ts);
+    int vfylevel = rpmtsVfyLevel(ts);
+
+    vsflags |= rpmcliVSFlags;
+    if (rpmcliVfyLevelMask) {
+	vfylevel &= ~rpmcliVfyLevelMask;
+	rpmtsSetVfyLevel(ts, vfylevel);
+    }
+
+    FD_t fd = fdDup(Fileno(fdi));
+    if (fd == NULL || Ferror(fd)) {
+	rpmlog(RPMLOG_ERR, _("fdDup failed: %s\n"), Fstrerror(fd));
+	res++;
+    } else if (rpmpkgVerifySigs(keyring, vfylevel, vsflags, fd, "stdin")) {
+	res++;
+    }
+
+    lseek(Fileno(fd), SEEK_SET, 0);
+    Fclose(fd);
+
+    rpmKeyringFree(keyring);
+    return res;
+}
+
