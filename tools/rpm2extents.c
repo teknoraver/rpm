@@ -139,16 +139,40 @@ static int digestoffsetCmp(const void * a, const void * b) {
         );
 }
 
-static rpmRC validator(FD_t fdi){
+static rpmRC validator(FD_t fdi, FD_t fdo){
+    int rc;
+    char *msg = NULL;
     rpmts ts = rpmtsCreate();
+    size_t validator_len =  0;
+    size_t len;
+
     rpmtsSetRootDir(ts, rpmcliRootDir);
-    /* rpmlog prints NOTICE to stdout */
-    // rpmlogSetFile(stderr);
-    if(rpmcliVerifySignaturesFD(ts, fdi)){
+    rc = rpmcliVerifySignaturesFD(ts, fdi, &msg);
+    if(rc){
 	fprintf(stderr, _("Error validating package\n"));
-	return RPMRC_FAIL;
     }
-    return RPMRC_OK;
+    len = sizeof(rc);
+    if (Fwrite(&rc, len, 1, fdo) != len) {
+	fprintf(stderr, _("Unable to write validator RC code %d\n"), rc);
+	goto exit;
+    }
+    if (msg)
+        validator_len = strlen(msg);
+    len = sizeof(validator_len);
+    if (Fwrite(&validator_len, len, 1, fdo) != len) {
+	fprintf(stderr, _("Unable to write validator output length code %zd\n"), validator_len);
+	goto exit;
+    }
+    if (Fwrite(msg, validator_len, 1, fdo) != validator_len) {
+	fprintf(stderr, _("Unable to write validator output %s\n"), msg);
+	goto exit;
+    }
+
+exit:
+    if(msg) {
+	free(msg);
+    }
+    return rc ? RPMRC_FAIL : RPMRC_OK;
 }
 
 static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
@@ -160,7 +184,7 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
     rpmRC rc = RPMRC_OK;
     rpm_mode_t mode;
     char *rpmio_flags = NULL, *zeros;
-    rpm_loff_t pos, size, pad, digest_pos, validation_pos;
+    rpm_loff_t pos, size, pad, digest_pos, validation_pos, digest_table_pos;
     uint32_t offset_ix = 0;
     size_t len;
     int next = 0;
@@ -267,6 +291,16 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
     qsort(offsets, (size_t)offset_ix, sizeof(struct digestoffset),
 	  digestoffsetCmp);
 
+    validation_pos = pos;
+    validation_len = ufdCopy(validationi, fdo);
+    if (validation_len == -1) {
+	fprintf(stderr, _("validation output ufdCopy failed\n"));
+	rc = RPMRC_FAIL;
+	goto exit;
+    }
+
+    digest_table_pos = validation_pos + validation_len;
+
     len = sizeof(offset_ix);
     if (Fwrite(&offset_ix, len, 1, fdo) != len) {
 	fprintf(stderr, _("Unable to write length of table\n"));
@@ -293,21 +327,13 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
 	}
     }
     digest_pos = (
-	pos + sizeof(offset_ix) + sizeof(diglen) +
+	digest_table_pos + sizeof(offset_ix) + sizeof(diglen) +
 	offset_ix * (diglen + sizeof(rpm_loff_t))
     );
 
     digest_len = ufdCopy(digestori, fdo);
     if (digest_len == -1) {
 	fprintf(stderr, _("digest table ufdCopy failed\n"));
-	rc = RPMRC_FAIL;
-	goto exit;
-    }
-
-    validation_pos = digest_pos + digest_len;
-    validation_len = ufdCopy(validationi, fdo);
-    if (validation_len == -1) {
-	fprintf(stderr, _("validation output ufdCopy failed\n"));
 	rc = RPMRC_FAIL;
 	goto exit;
     }
@@ -325,18 +351,18 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
 	goto exit;
     }
     zeros = _free(zeros);
-    if (Fwrite(&pos, len, 1, fdo) != len) {
+    if (Fwrite(&validation_pos, len, 1, fdo) != len) {
+	fprintf(stderr, _("Unable to write offset of validation output\n"));
+	rc = RPMRC_FAIL;
+	goto exit;
+    }
+    if (Fwrite(&digest_table_pos, len, 1, fdo) != len) {
 	fprintf(stderr, _("Unable to write offset of digest table\n"));
 	rc = RPMRC_FAIL;
 	goto exit;
     }
-    if (Fwrite(&validation_pos, len, 1, fdo) != len) {
+    if (Fwrite(&digest_pos, len, 1, fdo) != len) {
 	fprintf(stderr, _("Unable to write offset of validation table\n"));
-	rc = RPMRC_FAIL;
-	goto exit;
-    }
-    if (Fwrite(&validation_pos, len, 1, fdo) != len) {
-	fprintf(stderr, _("Unable to write offset of validation output\n"));
 	rc = RPMRC_FAIL;
 	goto exit;
     }
@@ -419,11 +445,9 @@ static int teeRpm(FD_t fdi, FD_t digestori) {
 	close(validatorpipefd[1]);
 	close(rpmsignpipefd[0]);
 	FD_t fdi = fdDup(validatorpipefd[0]);
-	// redirect STDOUT to the pipe
-	close(STDOUT_FILENO);
 	FD_t fdo = fdDup(rpmsignpipefd[1]);
 	close(rpmsignpipefd[1]);
-	rc = validator(fdi);
+	rc = validator(fdi, fdo);
 	if(rc != RPMRC_OK) {
 	    fprintf(stderr, _("Validator failed\n"));
 	}
@@ -474,6 +498,7 @@ static int teeRpm(FD_t fdi, FD_t digestori) {
 	    close(rpmsignpipefd[0]);
 	    close(rpmsignpipefd[1]);
 
+	    rc = RPMRC_OK;
 	    offt = ufdTee(fdi, fds, 2);
 	    if(offt == -1){
 		fprintf(stderr, _("Failed to tee RPM\n"));
