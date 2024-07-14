@@ -18,7 +18,7 @@
 #include <rpm/rpmlib.h>
 #include <rpm/rpmplugin.h>
 #include <rpm/rpmfileutil.h>
-
+#include <rpm/rpmextents_internal.h>
 
 #include "debug.h"
 
@@ -38,11 +38,6 @@ using inodeIndexHash = std::unordered_map<rpm_ino_t, int>;
 #define NOT_FOUND 0
 
 #define BUFFER_SIZE (1024 * 128)
-
-/* magic value at end of file (64 bits) that indicates this is a transcoded
- * rpm.
- */
-#define MAGIC 3472329499408095051
 
 struct reflink_state_s {
     reflink_state_s() : fundamental_block_size(0), buffer(NULL), keys(0), keysize(0),
@@ -112,7 +107,7 @@ static rpmRC reflink_psm_pre(rpmPlugin plugin, rpmte te) {
 	}
 	return RPMRC_FAIL;
     }
-    if (magic != MAGIC) {
+    if (magic != EXTENTS_MAGIC) {
 	rpmlog(RPMLOG_DEBUG, _("reflink: not transcoded\n"));
 	if (Fseek(state->fd, current, SEEK_SET) < 0) {
 	    rpmlog(RPMLOG_ERR,
@@ -130,7 +125,7 @@ static rpmRC reflink_psm_pre(rpmPlugin plugin, rpmte te) {
     headerFree(h);
     state->files = rpmteFiles(te);
     /* tail of file contains offset_table, offset_checksums then magic */
-    if (Fseek(state->fd, -(sizeof(rpm_loff_t) * 2 + sizeof(magic)), SEEK_END) < 0) {
+    if (Fseek(state->fd, -(sizeof(rpm_loff_t) * 2 + sizeof(extents_magic_t)), SEEK_END) < 0) {
 	rpmlog(RPMLOG_ERR, _("reflink: failed to seek for tail %p\n"),
 	       state->fd);
 	return RPMRC_FAIL;

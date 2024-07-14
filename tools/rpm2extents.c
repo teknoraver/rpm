@@ -13,6 +13,7 @@
 #include <rpm/rpmio.h>
 #include <rpm/rpmpgp.h>
 #include <rpm/rpmts.h>
+#include <rpm/rpmextents_internal.h>
 
 #include "rpmlead.h"
 #include "signature.h"
@@ -29,11 +30,6 @@
 #include "debug.h"
 
 using digestSet = std::set<std::vector<unsigned char>>;
-
-/* magic value at end of file (64 bits) that indicates this is a transcoded
- * rpm.
- */
-#define MAGIC 3472329499408095051
 
 struct digestoffset {
     const unsigned char * digest;
@@ -215,7 +211,7 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
     uint32_t offset_ix = 0;
     size_t len;
     int next = 0;
-    uint64_t magic = MAGIC;
+    extents_magic_t magic = EXTENTS_MAGIC;
     ssize_t validation_len;
     ssize_t digest_len;
 
