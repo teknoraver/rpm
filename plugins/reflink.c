@@ -29,7 +29,7 @@
 #define HTKEYTYPE rpm_ino_t
 #define HTDATATYPE int
 
-using inodeIndexHash = std::unordered_map<rpm_ino_t, int>;
+using inodeIndexHash = std::unordered_map<rpm_ino_t, const char *>;
 
 /* We use this in find to indicate a key wasn't found. This is an
  * unrecoverable error, but we can at least show a decent error. 0 is never a
@@ -242,17 +242,14 @@ static rpmRC reflink_fsm_file_install(rpmPlugin plugin, rpmfi fi, const char* pa
 	 */
         auto it = state->inodeIndexes.find(inode);
         if (it != state->inodeIndexes.end()) {
-            int hlix = it->second;
+            const char *hl_target = it->second;
 	    /* entry is in table, use hard link */
-	    char *fn = rpmfilesFN(state->files, hlix);
-	    if (link(fn, fullpath) != 0) {
+	    if (link(hl_target, fullpath) != 0) {
 		rpmlog(RPMLOG_ERR,
 		       _("reflink: Unable to hard link %s -> %s due to %s\n"),
-		       fn, path, strerror(errno));
-		free(fn);
+		       hl_target, path, strerror(errno));
 		return RPMRC_FAIL;
 	    }
-	    free(fn);
 	    return RPMRC_PLUGIN_CONTENTS;
 	}
 	/* if we didn't hard link, then we'll track this inode as being
@@ -260,7 +257,7 @@ static rpmRC reflink_fsm_file_install(rpmPlugin plugin, rpmfi fi, const char* pa
 	 */
 	if (rpmfiFNlink(fi) > 1) {
 	    /* minor optimization: only store files with more than one link */
-            state->inodeIndexes.insert({inode, rpmfiFX(fi)});
+            state->inodeIndexes.insert({inode, strdup(fullpath)});
 	}
 	/* derived from wfd_open in fsm.c */
 	mode_t old_umask = umask(0577);
