@@ -145,7 +145,7 @@ static int digestoffsetCmp(const void * a, const void * b) {
  * @param package_name	package name
  * @return 		true if package is in deny list
  */
-static inline int isInDenyList(char * package_name)
+static inline int isInDenyList(char *package_name)
 {
     int is_in_deny_list = 0;
     if (package_name) {
@@ -159,7 +159,7 @@ static inline int isInDenyList(char * package_name)
 	    denytlist_item = strtok(NULL, ",");
 	}
     }
-	return is_in_deny_list;
+    return is_in_deny_list;
 }
 
 static rpmRC FDWriteSignaturesValidation(FD_t fdo, int rpmvsrc, char *msg) {
@@ -234,6 +234,22 @@ exit:
     return rc;
 }
 
+static void sanitizeSignatureHeader(Header * sigh)
+{
+    struct rpmtd_s td;
+
+    /* This is inspired by the code in unloadImmutableRegion. See https://github.com/rpm-software-management/rpm/pull/1330 */
+    if (!headerGet(*sigh, RPMTAG_HEADERSIGNATURES, &td, HEADERGET_DEFAULT)) {
+	/* Signature header corrupt/missing */
+	rpmlog(RPMLOG_WARNING, _("Error verifying signature header\n"));
+	rpmtdFreeData(&td);
+	Header nh = headerCopy(*sigh);
+	headerFree(*sigh);
+	*sigh = headerLink(nh);
+	headerFree(nh);
+    }
+}
+
 static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
 {
     FD_t fdo;
@@ -247,9 +263,6 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
     uint32_t offset_ix = 0;
     size_t len;
     int next = 0;
-    ssize_t validation_len;
-    ssize_t digest_len;
-    struct extents_footer_t footer = { .magic = EXTENTS_MAGIC };
     struct rpmlead_s l;
     rpmfiles files = NULL;
     rpmfi fi = NULL;
@@ -263,43 +276,47 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
 
     /* Skip conversion if package is in deny list */
     if (isInDenyList(l.name)) {
+	rpmlog(RPMLOG_WARNING, _("package %s is in deny list: conversion skipped\n"), l.name);
 	if (rpmLeadWrite(fdo, l)) {
-		fprintf(stderr, _("Unable to write package lead: %s\n"),
-		Fstrerror(fdo));
+	    rpmlog(RPMLOG_ERR, _("Unable to write package lead: %s\n"),
+		    Fstrerror(fdo));
 	    rc = RPMRC_FAIL;
 	    goto exit;
 	}
 
 	ssize_t fdilength = ufdCopy(fdi, fdo);
 	if (fdilength == -1) {
-	    fprintf(stderr, _("process_package cat failed\n"));
+	    rpmlog(RPMLOG_ERR, _("process_package cat failed\n"));
 	    rc = RPMRC_FAIL;
 	    goto exit;
 	}
 
 	goto exit;
     } else {
-    if (rpmReadPackageRaw(fdi, &sigh, &h)) {
-	rpmlog(RPMLOG_ERR, _("Error reading package\n"));
-	exit(EXIT_FAILURE);
-    }
+	if (rpmReadPackageRaw(fdi, &sigh, &h)) {
+	    rpmlog(RPMLOG_ERR, _("Error reading package\n"));
+	    exit(EXIT_FAILURE);
+	}
 
-    if (rpmLeadWriteFromHeader(fdo, h))
-    {
-	rpmlog(RPMLOG_ERR, _("Unable to write package lead: %s\n"),
-		Fstrerror(fdo));
-	exit(EXIT_FAILURE);
-    }
+	sanitizeSignatureHeader(&sigh);
 
-    if (rpmWriteSignature(fdo, sigh)) {
-	rpmlog(RPMLOG_ERR, _("Unable to write signature: %s\n"), Fstrerror(fdo));
-	exit(EXIT_FAILURE);
-    }
+	if (rpmLeadWriteFromHeader(fdo, h)) {
+	    rpmlog(RPMLOG_ERR, _("Unable to write package lead: %s\n"),
+		   Fstrerror(fdo));
+	    exit(EXIT_FAILURE);
+	}
 
-    if (headerWrite(fdo, h, HEADER_MAGIC_YES)) {
-	rpmlog(RPMLOG_ERR, _("Unable to write headers: %s\n"), Fstrerror(fdo));
-	exit(EXIT_FAILURE);
-    }
+	if (rpmWriteSignature(fdo, sigh)) {
+	    rpmlog(RPMLOG_ERR, _("Unable to write signature: %s\n"),
+		   Fstrerror(fdo));
+	    exit(EXIT_FAILURE);
+	}
+
+	if (headerWrite(fdo, h, HEADER_MAGIC_YES)) {
+	    rpmlog(RPMLOG_ERR, _("Unable to write headers: %s\n"),
+		   Fstrerror(fdo));
+	    exit(EXIT_FAILURE);
+	}
 
     /* Retrieve payload size and compression type. */
     {
@@ -310,10 +327,11 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
     gzdi = Fdopen(fdi, rpmio_flags);	/* XXX gzdi == fdi */
     free(rpmio_flags);
 
-    if (gzdi == NULL) {
-	rpmlog(RPMLOG_ERR, _("cannot re-open payload: %s\n"), Fstrerror(gzdi));
-	exit(EXIT_FAILURE);
-    }
+	if (gzdi == NULL) {
+	    rpmlog(RPMLOG_ERR, _("cannot re-open payload: %s\n"),
+		   Fstrerror(gzdi));
+	    exit(EXIT_FAILURE);
+	}
 
     files = rpmfilesNew(NULL, h, 0, RPMFI_KEEPHEADER);
     fi = rpmfiNewArchiveReader(gzdi, files,
@@ -333,121 +351,125 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
 
     zeros = (char *)xcalloc(fundamental_block_size, 1);
 
-    while (next >= 0) {
-	next = rpmfiNext(fi);
-	if (next == RPMERR_ITER_END) {
-	    rc = RPMRC_OK;
-	    break;
+	while (next >= 0) {
+	    next = rpmfiNext(fi);
+	    if (next == RPMERR_ITER_END) {
+		rc = RPMRC_OK;
+		break;
+	    }
+	    mode = rpmfiFMode(fi);
+	    if (!S_ISREG(mode) || !rpmfiArchiveHasContent(fi)) {
+		/* not a regular file, or the archive doesn't contain any content
+		 * for this entry.
+		 */
+		continue;
+	    }
+	    const unsigned char *digestb = rpmfiFDigest(fi, NULL, NULL);
+            std::vector<unsigned char> digest(digestb, digestb + diglen);
+            auto it = ds.find(digest);
+            if (it != ds.end()) {
+                /* This specific digest has already been included, so skip it. */
+                continue;
+            }
+	    pad = pad_to(pos, fundamental_block_size);
+	    if (Fwrite(zeros, sizeof(char), pad, fdo) != pad) {
+		rpmlog(RPMLOG_ERR, _("Unable to write padding\n"));
+		rc = RPMRC_FAIL;
+		goto exit;
+	    }
+	    /* round up to next fundamental_block_size */
+	    pos += pad;
+            ds.insert(digest);
+	    offsets[offset_ix].digest = digestb;
+	    offsets[offset_ix].pos = pos;
+	    offset_ix++;
+	    size = rpmfiFSize(fi);
+	    rc = (rpmRC)rpmfiArchiveReadToFile(fi, fdo, 0);
+	    if (rc != RPMRC_OK) {
+		char *errstr = rpmfileStrerror(rc);
+		rpmlog(RPMLOG_ERR,
+		       _("rpmfiArchiveReadToFile failed while extracting "
+			 "\"%s\" with RC %d: %s\n"),
+		       rpmfiFN(fi), rc, errstr);
+		free(errstr);
+		goto exit;
+	    }
+	    pos += size;
 	}
-	mode = rpmfiFMode(fi);
-	if (!S_ISREG(mode) || !rpmfiArchiveHasContent(fi)) {
-	    /* not a regular file, or the archive doesn't contain any content
-	     * for this entry.
-	    */
-	    continue;
-	}
-	unsigned char *digestb = (unsigned char*)rpmfiFDigest(fi, NULL, NULL);
-        std::vector<unsigned char> digest(digestb, digestb + diglen);
-        if (ds.find(digest) != ds.end()) {
-	    continue;
-	}
-	pad = pad_to(pos, fundamental_block_size);
-	if (Fwrite(zeros, sizeof(char), pad, fdo) != pad) {
-	    rpmlog(RPMLOG_ERR, _("Unable to write padding\n"));
-	    rc = RPMRC_FAIL;
-	    goto exit;
-	}
-	/* round up to next fundamental_block_size */
-	pos += pad;
-        ds.insert(digest);
-	offsets[offset_ix].digest = digestb;
-	offsets[offset_ix].pos = pos;
-	offset_ix++;
-	size = rpmfiFSize(fi);
-	rc = (rpmRC)rpmfiArchiveReadToFile(fi, fdo, 0);
-	if (rc != RPMRC_OK) {
-	    char *errstr = rpmfileStrerror(rc);
-	    rpmlog(RPMLOG_ERR,
-		   _("rpmfiArchiveReadToFile failed while extracting "\
-		   "\"%s\" with RC %d: %s\n"),
-		   rpmfiFN(fi), rc, errstr);
-	    free(errstr);
-	    goto exit;
-	}
-	pos += size;
-    }
-    Fclose(gzdi);	/* XXX gzdi == fdi */
+	Fclose(gzdi);		/* XXX gzdi == fdi */
 
 	qsort(offsets, (size_t) offset_ix, sizeof(struct digestoffset),
 	      digestoffsetCmp);
 
-    validation_pos = pos;
-    validation_len = ufdCopy(validationi, fdo);
-    if (validation_len == -1) {
-	rpmlog(RPMLOG_ERR, _("validation output ufdCopy failed\n"));
-	rc = RPMRC_FAIL;
-	goto exit;
-    }
-
-    digest_table_pos = validation_pos + validation_len;
-
-    len = sizeof(offset_ix);
-    if (Fwrite(&offset_ix, len, 1, fdo) != len) {
-	rpmlog(RPMLOG_ERR, _("Unable to write length of table\n"));
-	rc = RPMRC_FAIL;
-	goto exit;
-    }
-    len = sizeof(diglen);
-    if (Fwrite(&diglen, len, 1, fdo) != len) {
-	rpmlog(RPMLOG_ERR, _("Unable to write length of digest\n"));
-	rc = RPMRC_FAIL;
-	goto exit;
-    }
-    len = sizeof(rpm_loff_t);
-    for (int x = 0; x < offset_ix; x++) {
-	if (Fwrite(offsets[x].digest, diglen, 1, fdo) != diglen) {
-	    rpmlog(RPMLOG_ERR, _("Unable to write digest\n"));
+	validation_pos = pos;
+	ssize_t validation_len = ufdCopy(validationi, fdo);
+	if (validation_len == -1) {
+	    rpmlog(RPMLOG_ERR, _("validation output ufdCopy failed\n"));
 	    rc = RPMRC_FAIL;
 	    goto exit;
 	}
-	if (Fwrite(&offsets[x].pos, len, 1, fdo) != len) {
-	    rpmlog(RPMLOG_ERR, _("Unable to write offset\n"));
+
+	digest_table_pos = validation_pos + validation_len;
+
+	len = sizeof(offset_ix);
+	if (Fwrite(&offset_ix, len, 1, fdo) != len) {
+	    rpmlog(RPMLOG_ERR, _("Unable to write length of table\n"));
 	    rc = RPMRC_FAIL;
 	    goto exit;
 	}
-    }
-    digest_pos = (
-	digest_table_pos + sizeof(offset_ix) + sizeof(diglen) +
-	offset_ix * (diglen + sizeof(rpm_loff_t))
-    );
+	len = sizeof(diglen);
+	if (Fwrite(&diglen, len, 1, fdo) != len) {
+	    rpmlog(RPMLOG_ERR, _("Unable to write length of digest\n"));
+	    rc = RPMRC_FAIL;
+	    goto exit;
+	}
+	len = sizeof(rpm_loff_t);
+	for (int x = 0; x < offset_ix; x++) {
+	    if (Fwrite(offsets[x].digest, diglen, 1, fdo) != diglen) {
+		rpmlog(RPMLOG_ERR, _("Unable to write digest\n"));
+		rc = RPMRC_FAIL;
+		goto exit;
+	    }
+	    if (Fwrite(&offsets[x].pos, len, 1, fdo) != len) {
+		rpmlog(RPMLOG_ERR, _("Unable to write offset\n"));
+		rc = RPMRC_FAIL;
+		goto exit;
+	    }
+	}
+	digest_pos =
+	    (digest_table_pos + sizeof(offset_ix) + sizeof(diglen) +
+	     offset_ix * (diglen + sizeof(rpm_loff_t))
+	    );
 
-    digest_len = ufdCopy(digestori, fdo);
-    if (digest_len == -1) {
-	rpmlog(RPMLOG_ERR, _("digest table ufdCopy failed\n"));
-	rc = RPMRC_FAIL;
-	goto exit;
-    }
+	ssize_t digest_len = ufdCopy(digestori, fdo);
+	if (digest_len == -1) {
+	    rpmlog(RPMLOG_ERR, _("digest table ufdCopy failed\n"));
+	    rc = RPMRC_FAIL;
+	    goto exit;
+	}
+	/* add more padding so the last file can be cloned. It doesn't matter that
+	 * the table and validation etc are in this space. In fact, it's pretty
+	 * efficient if it is.
+	 */
 
-    /* add more padding so the last file can be cloned. It doesn't matter that
-     * the table and validation etc are in this space. In fact, it's pretty
-     * efficient if it is.
-    */
-
-    pad = pad_to((validation_pos + validation_len + 2 * sizeof(rpm_loff_t) +
-		 sizeof(uint64_t)), fundamental_block_size);
-    if (Fwrite(zeros, sizeof(char), pad, fdo) != pad) {
-	rpmlog(RPMLOG_ERR, _("Unable to write final padding\n"));
-	rc = RPMRC_FAIL;
-	goto exit;
-    }
-    zeros = _free(zeros);
-    footer.offsets = { (off64_t)validation_pos, (off64_t)digest_table_pos, (off64_t)digest_pos };
-    len = sizeof(footer);
-    if (Fwrite(&footer, len, 1, fdo) != len) {
-	rpmlog(RPMLOG_ERR, _("Unable to write footer\n"));
-	rc = RPMRC_FAIL;
-	goto exit;
-    }
+	pad =
+	    pad_to((validation_pos + validation_len +
+		    2 * sizeof(rpm_loff_t) + sizeof(uint64_t)),
+		   fundamental_block_size);
+	if (Fwrite(zeros, sizeof(char), pad, fdo) != pad) {
+	    rpmlog(RPMLOG_ERR, _("Unable to write final padding\n"));
+	    rc = RPMRC_FAIL;
+	    goto exit;
+	}
+	zeros = _free(zeros);
+	struct extents_footer_t footer = { .offsets =
+		{ (off64_t)validation_pos, (off64_t)digest_table_pos, (off64_t)digest_pos }, .magic = EXTENTS_MAGIC };
+	len = sizeof(footer);
+	if (Fwrite(&footer, len, 1, fdo) != len) {
+	    rpmlog(RPMLOG_ERR, _("Unable to write footer\n"));
+	    rc = RPMRC_FAIL;
+	    goto exit;
+	}
     }
 
 exit:
