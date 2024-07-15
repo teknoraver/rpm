@@ -218,6 +218,7 @@ static rpmRC reflink_psm_pre(rpmPlugin plugin, rpmte te) {
 	       _("reflink: unable to seek back to original location\n"));
 	return RPMRC_FAIL;
     }
+    state->transcoded = 0;
     return RPMRC_OK;
 }
 
