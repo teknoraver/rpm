@@ -225,9 +225,9 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
     uint32_t offset_ix = 0;
     size_t len;
     int next = 0;
-    extents_magic_t magic = EXTENTS_MAGIC;
     ssize_t validation_len;
     ssize_t digest_len;
+    struct extents_footer_t footer = { .magic = EXTENTS_MAGIC };
 
     fdo = fdDup(STDOUT_FILENO);
 
@@ -393,24 +393,10 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
 	goto exit;
     }
     zeros = _free(zeros);
-    if (Fwrite(&validation_pos, len, 1, fdo) != len) {
-	rpmlog(RPMLOG_ERR, _("Unable to write offset of validation output\n"));
-	rc = RPMRC_FAIL;
-	goto exit;
-    }
-    if (Fwrite(&digest_table_pos, len, 1, fdo) != len) {
-	rpmlog(RPMLOG_ERR, _("Unable to write offset of digest table\n"));
-	rc = RPMRC_FAIL;
-	goto exit;
-    }
-    if (Fwrite(&digest_pos, len, 1, fdo) != len) {
-	rpmlog(RPMLOG_ERR, _("Unable to write offset of validation table\n"));
-	rc = RPMRC_FAIL;
-	goto exit;
-    }
-    len = sizeof(magic);
-    if (Fwrite(&magic, len, 1, fdo) != len) {
-	rpmlog(RPMLOG_ERR, _("Unable to write magic\n"));
+    footer.offsets = { (off64_t)validation_pos, (off64_t)digest_table_pos, (off64_t)digest_pos };
+    len = sizeof(footer);
+    if (Fwrite(&footer, len, 1, fdo) != len) {
+	rpmlog(RPMLOG_ERR, _("Unable to write footer\n"));
 	rc = RPMRC_FAIL;
 	goto exit;
     }
