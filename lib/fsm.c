@@ -18,7 +18,6 @@
 #include <rpm/rpmts.h>
 #include <rpm/rpmlog.h>
 #include <rpm/rpmmacro.h>
-#include <rpm/rpmlib.h>
 
 #include "rpmio_internal.h"	/* fdInit/FiniDigest */
 #include "fsm.h"
@@ -871,6 +870,24 @@ static rpmfi fsmIterFini(rpmfi fi, struct diriter_s *di)
     return rpmfiFree(fi);
 }
 
+static int fiIterator(rpmPlugins plugins, FD_t payload, rpmfiles files, rpmfi *fi)
+{
+    rpmRC plugin_rc = rpmpluginsCallFsmFileArchiveReader(plugins, payload, files, fi);
+    switch (plugin_rc) {
+	case RPMRC_PLUGIN_CONTENTS:
+	    if (*fi == NULL)
+                return RPMERR_BAD_MAGIC;
+            return RPMRC_OK;
+	case RPMRC_OK:
+	    *fi = rpmfiNewArchiveReader(payload, files, RPMFI_ITER_READ_ARCHIVE);
+	    if (*fi == NULL)
+                return RPMERR_BAD_MAGIC;
+            return RPMRC_OK;
+	default:
+            return RPMRC_FAIL;
+    }
+}
+
 int rpmPackageFilesInstall(rpmts ts, rpmte te, rpmfiles files,
               rpmpsm psm, char ** failedFile)
 {
@@ -888,14 +905,7 @@ int rpmPackageFilesInstall(rpmts ts, rpmte te, rpmfiles files,
     struct filedata_s *fdata = (struct filedata_s *)xcalloc(fc, sizeof(*fdata));
     struct filedata_s *firstlink = NULL;
     struct diriter_s di = { -1, -1 };
-    Header h = rpmteHeader(te);
-    const char *payloadfmt = headerGetString(h, RPMTAG_PAYLOADFORMAT);
-    bool cpio = true;
     rpmRC plugin_rc;
-
-    if (payloadfmt && rstreq(payloadfmt, "clon")) {
-	cpio = false;
-    }
 
     /* transaction id used for temporary path suffix while installing */
     rasprintf(&tid, ";%08x", (unsigned)rpmtsGetTid(ts));
@@ -930,12 +940,9 @@ int rpmPackageFilesInstall(rpmts ts, rpmte te, rpmfiles files,
     if (rc)
 	goto exit;
 
-    if (cpio) {
-	fi = fsmIter(payload, files,
-		     payload ? RPMFI_ITER_READ_ARCHIVE : RPMFI_ITER_FWD, &di);
-    } else {
-	fi = rpmfilesIter(files, RPMFI_ITER_FWD);
-    }
+    rc = fiIterator(plugins, payload, files, &fi);
+    if (rc)
+        goto exit;
 
     if (fi == NULL) {
         rc = RPMERR_BAD_MAGIC;
@@ -959,7 +966,7 @@ int rpmPackageFilesInstall(rpmts ts, rpmte te, rpmfiles files,
 	    int mayopen = 0;
 	    int fd = -1;
 
-	    if (!cpio && di.dirfd >= 0)
+	    if (di.dirfd >= 0)
 		fsmClose(&di.dirfd);
 	    rc = ensureDir(plugins, rpmfiDN(fi), 0,
 			    (fp->action == FA_CREATE), 0, &di.dirfd);
@@ -1078,16 +1085,15 @@ setmeta:
 	rc = fx;
 
     /* If all went well, commit files to final destination */
-    if (cpio) {
-	fi = fsmIter(NULL, files, RPMFI_ITER_FWD, &di);
-    } else {
-	fi = rpmfilesIter(files, RPMFI_ITER_FWD);
-    }
+    rc = fiIterator(plugins, payload, files, &fi);
+    if (rc)
+        goto exit;
+
     while (!rc && (fx = rpmfiNext(fi)) >= 0) {
 	struct filedata_s *fp = &fdata[fx];
 
 	if (!fp->skip) {
-	    if (!cpio && di.dirfd >= 0)
+	    if (di.dirfd >= 0)
 		fsmClose(&di.dirfd);
 	    if (!rc)
 		rc = ensureDir(NULL, rpmfiDN(fi), 0, 0, 0, &di.dirfd);
