@@ -140,6 +140,28 @@ static int digestoffsetCmp(const void * a, const void * b) {
         );
 }
 
+/**
+ * Check if package is in deny list.
+ * @param package_name	package name
+ * @return 		true if package is in deny list
+ */
+static inline int isInDenyList(char * package_name)
+{
+    int is_in_deny_list = 0;
+    if (package_name) {
+	char *e_denylist = getenv("LIBREPO_TRANSCODE_RPMS_DENYLIST");
+	char *denytlist_item = strtok(e_denylist, ",");
+	while (denytlist_item) {
+	    if (strstr(package_name, denytlist_item)) {
+		is_in_deny_list = 1;
+		break;
+	    }
+	    denytlist_item = strtok(NULL, ",");
+	}
+    }
+	return is_in_deny_list;
+}
+
 static rpmRC FDWriteSignaturesValidation(FD_t fdo, int rpmvsrc, char *msg) {
     size_t content_len = 0;
     size_t len;
@@ -228,15 +250,41 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
     ssize_t validation_len;
     ssize_t digest_len;
     struct extents_footer_t footer = { .magic = EXTENTS_MAGIC };
+    struct rpmlead_s l;
+    rpmfiles files = NULL;
+    rpmfi fi = NULL;
+    char *msg = NULL;
 
     fdo = fdDup(STDOUT_FILENO);
 
+    rc = rpmLeadReadAndReturn(fdi, &msg, &l);
+    if (rc != RPMRC_OK)
+	goto exit;
+
+    /* Skip conversion if package is in deny list */
+    if (isInDenyList(l.name)) {
+	if (rpmLeadWrite(fdo, l)) {
+		fprintf(stderr, _("Unable to write package lead: %s\n"),
+		Fstrerror(fdo));
+	    rc = RPMRC_FAIL;
+	    goto exit;
+	}
+
+	ssize_t fdilength = ufdCopy(fdi, fdo);
+	if (fdilength == -1) {
+	    fprintf(stderr, _("process_package cat failed\n"));
+	    rc = RPMRC_FAIL;
+	    goto exit;
+	}
+
+	goto exit;
+    } else {
     if (rpmReadPackageRaw(fdi, &sigh, &h)) {
 	rpmlog(RPMLOG_ERR, _("Error reading package\n"));
 	exit(EXIT_FAILURE);
     }
 
-    if (rpmLeadWrite(fdo, h))
+    if (rpmLeadWriteFromHeader(fdo, h))
     {
 	rpmlog(RPMLOG_ERR, _("Unable to write package lead: %s\n"),
 		Fstrerror(fdo));
@@ -267,9 +315,9 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
 	exit(EXIT_FAILURE);
     }
 
-    rpmfiles files = rpmfilesNew(NULL, h, 0, RPMFI_KEEPHEADER);
-    rpmfi fi = rpmfiNewArchiveReader(gzdi, files,
-				     RPMFI_ITER_READ_ARCHIVE_CONTENT_FIRST);
+    files = rpmfilesNew(NULL, h, 0, RPMFI_KEEPHEADER);
+    fi = rpmfiNewArchiveReader(gzdi, files,
+			       RPMFI_ITER_READ_ARCHIVE_CONTENT_FIRST);
 
     /* this is encoded in the file format, so needs to be fixed size (for
      * now?)
@@ -330,8 +378,8 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
     }
     Fclose(gzdi);	/* XXX gzdi == fdi */
 
-    qsort(offsets, (size_t)offset_ix, sizeof(struct digestoffset),
-	  digestoffsetCmp);
+	qsort(offsets, (size_t) offset_ix, sizeof(struct digestoffset),
+	      digestoffsetCmp);
 
     validation_pos = pos;
     validation_len = ufdCopy(validationi, fdo);
@@ -399,6 +447,7 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
 	rpmlog(RPMLOG_ERR, _("Unable to write footer\n"));
 	rc = RPMRC_FAIL;
 	goto exit;
+    }
     }
 
 exit:
