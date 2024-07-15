@@ -134,6 +134,14 @@ runroot()
              --define "_topdir /build"
 }
 
+runroot_plugins()
+{
+    setup_env
+    (unset RPM_CONFIGDIR RPM_POPTEXEC_PATH; cd ${RPMTEST} && \
+     MAGIC="/magic/magic" FAKECHROOT_BASE="${RPMTEST}" fakechroot "$@" --define "_buildhost testhost" --define "_topdir /build" --nouserns
+    )
+}
+
 runroot_other()
 {
     setup_env
