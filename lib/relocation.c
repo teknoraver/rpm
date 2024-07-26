@@ -123,7 +123,7 @@ void rpmRelocateFileList(rpmRelocation *relocations, int numRelocations,
     char ** baseNames;
     char ** dirNames;
     uint32_t * dirIndexes;
-    rpm_count_t fileCount, dirCount;
+    rpm_count_t fileCount, dirCount, dirCountOrig;
     int nrelocated = 0;
     int fileAlloced = 0;
     char * fn = NULL;
@@ -162,7 +162,7 @@ void rpmRelocateFileList(rpmRelocation *relocations, int numRelocations,
     baseNames = bnames.data;
     dirIndexes = dindexes.data;
     fileCount = rpmtdCount(&bnames);
-    dirCount = rpmtdCount(&dnames);
+    dirCount = dirCountOrig = rpmtdCount(&dnames);
     /* XXX TODO: use rpmtdDup() instead */
     dirNames = dnames.data = duparray(dnames.data, dirCount);
     dnames.flags |= RPMTD_PTR_ALLOCED;
@@ -179,8 +179,9 @@ void rpmRelocateFileList(rpmRelocation *relocations, int numRelocations,
 	rpmFileTypes ft;
 	int fnlen;
 
+	size_t baselen = strlen(baseNames[i]);
 	size_t len = maxlen +
-		strlen(dirNames[dirIndexes[i]]) + strlen(baseNames[i]) + 1;
+		strlen(dirNames[dirIndexes[i]]) + baselen + 1;
 	if (len >= fileAlloced) {
 	    fileAlloced = len * 2;
 	    fn = xrealloc(fn, fileAlloced);
@@ -242,8 +243,9 @@ assert(fn != NULL);		/* XXX can't happen */
 	    continue;
 	}
 
-	/* Relocation on full paths only, please. */
-	if (fnlen != len) continue;
+	/* Relocation on '/' and full paths only, please. */
+	if (baselen && fnlen != len)
+	    continue;
 
 	rpmlog(RPMLOG_DEBUG, "relocating %s to %s\n",
 	       fn, relocations[j].newPath);
@@ -294,7 +296,7 @@ assert(fn != NULL);		/* XXX can't happen */
     }
 
     /* Finish off by relocating directories. */
-    for (i = dirCount - 1; i >= 0; i--) {
+    for (i = dirCountOrig - 1; i >= 0; i--) {
 	for (j = numRelocations - 1; j >= 0; j--) {
 
 	    if (relocations[j].oldPath == NULL) /* XXX can't happen */
