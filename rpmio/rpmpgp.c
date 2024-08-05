@@ -563,7 +563,7 @@ static int pgpPrtSig(pgpTag tag, const uint8_t *h, size_t hlen,
 		     pgpDigParams _digp)
 {
     uint8_t version = 0;
-    uint8_t * p;
+    const uint8_t * p;
     unsigned int plen;
     int rc = 1;
 
@@ -616,10 +616,9 @@ static int pgpPrtSig(pgpTag tag, const uint8_t *h, size_t hlen,
 	pgpPrtVal(" ", pgpSigTypeTbl, v->sigtype);
 	pgpPrtNL();
 
-	p = &v->hashlen[0];
 	if (pgpGet(v->hashlen, sizeof(v->hashlen), h + hlen, &plen))
 	    return 1;
-	p += sizeof(v->hashlen);
+	p = ((uint8_t *)v) + sizeof(*v);
 
 	if ((p + plen) > (h + hlen))
 	    return 1;
