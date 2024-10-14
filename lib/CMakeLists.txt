@@ -46,6 +46,7 @@ target_sources(librpm PRIVATE
 	rpmchroot.cc rpmchroot.hh
 	rpmplugins.cc rpmplugins.hh rpmug.cc rpmug.hh
 	rpmtriggers.hh rpmtriggers.cc rpmvs.cc rpmvs.hh
+	rpmextents.c
 )
 
 if(ENABLE_SQLITE)
