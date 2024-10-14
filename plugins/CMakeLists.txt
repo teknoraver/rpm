@@ -1,5 +1,6 @@
 add_library(prioreset MODULE prioreset.c)
 add_library(syslog MODULE syslog.c)
+add_library(reflink MODULE reflink.cc)
 
 if(WITH_SELINUX)
 	add_library(selinux MODULE selinux.c)
@@ -48,8 +49,10 @@ set(RPM_PLUGINDIR ${CMAKE_INSTALL_FULL_LIBDIR}/rpm-plugins
 get_property(plugins DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 foreach(plugin ${plugins})
 	target_link_libraries(${plugin} PRIVATE librpmio librpm ${Intl_LIBRARIES})
-	target_include_directories(${plugin} PRIVATE ${Intl_INCLUDE_DIRS})
+	target_include_directories(${plugin} PRIVATE lib ${Intl_INCLUDE_DIRS})
 	install(TARGETS ${plugin} DESTINATION ${RPM_PLUGINDIR})
 	install(FILES macros.transaction_${plugin} DESTINATION ${RPM_MACROSDIR})
 endforeach()
 
+set (cxx_sources reflink.c)
+set_source_files_properties(${cxx_sources} PROPERTIES LANGUAGE CXX)

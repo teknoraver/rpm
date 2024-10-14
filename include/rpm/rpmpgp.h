@@ -263,6 +263,15 @@ typedef enum pgpValType_e {
 const char * pgpValString(pgpValType type, uint8_t val);
 
 /** \ingroup rpmpgp
+ * Return  OpenPGP value for a string.
+ * @param type		type of value
+ * @param str		string to lookup
+ * @param[out] val  byte value associated with string
+ * @return		0 on success else -1
+ */
+int pgpStringVal(pgpValType type, const char *str, uint8_t *val);
+
+/** \ingroup rpmpgp
  * Calculate OpenPGP public key fingerprint.
  * @param pkt		OpenPGP packet (i.e. PGPTAG_PUBLIC_KEY)
  * @param pktlen	OpenPGP packet length (no. of bytes)

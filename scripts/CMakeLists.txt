@@ -1,4 +1,4 @@
-install(PROGRAMS gendiff TYPE BIN)
+install(PROGRAMS gendiff rpm2extents_dump TYPE BIN)
 install(PROGRAMS
 	brp-compress brp-strip brp-strip-comment-note
 	brp-strip-static-archive brp-remove-la-files
