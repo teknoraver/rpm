@@ -371,7 +371,7 @@ rpmRC rpmpluginsCallFsmFilePre(rpmPlugins plugins, rpmfi fi, const char *path,
 	rpmPlugin plugin = plugins->plugins[i];
 	RPMPLUGINS_SET_HOOK_FUNC(fsm_file_pre);
 	if (hookFunc) {
-	    hook_rc = hookFunc(plugin, fi, path, file_mode, op);
+	    hook_rc = hookFunc(plugin, fi, apath, file_mode, op);
 	    if (hook_rc == RPMRC_FAIL) {
 		rpmlog(RPMLOG_ERR, "Plugin %s: hook fsm_file_pre failed\n", plugin->name);
 		rc = RPMRC_FAIL;
