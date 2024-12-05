@@ -444,12 +444,13 @@ rpmRC rpmpluginsCallFsmFileInstall(rpmPlugins plugins, rpmfi fi,
     int i;
     rpmRC rc = RPMRC_OK;
     rpmRC hook_rc;
+    char *apath = abspath(fi, path);
 
     for (i = 0; i < plugins->count; i++) {
 	rpmPlugin plugin = plugins->plugins[i];
 	RPMPLUGINS_SET_HOOK_FUNC(fsm_file_install);
 	if (hookFunc) {
-	    hook_rc = hookFunc(plugin, fi, path, file_mode, op);
+	    hook_rc = hookFunc(plugin, fi, apath, file_mode, op);
 	    if (hook_rc == RPMRC_FAIL) {
 		rpmlog(RPMLOG_ERR, "Plugin %s: hook fsm_file_install failed\n", plugin->name);
 		rc = RPMRC_FAIL;
@@ -467,6 +468,7 @@ rpmRC rpmpluginsCallFsmFileInstall(rpmPlugins plugins, rpmfi fi,
 	    }
 	}
     }
+    free(apath);
 
     return rc;
 }
