@@ -1,6 +1,7 @@
 add_library(prioreset MODULE prioreset.c)
 add_library(syslog MODULE syslog.c)
 add_library(reflink MODULE reflink.c)
+add_library(measure MODULE measure.c)
 
 if(WITH_SELINUX)
 	add_library(selinux MODULE selinux.c)
