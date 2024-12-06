@@ -51,6 +51,7 @@ set(TESTSUITE_AT
 	rpmvfylevel.at
 	rpmpgp.at
 	rpmdevel.at
+	rpm2extents.at
 )
 
 set(TESTPROGS rpmpgpcheck rpmpgppubkeyfingerprint)

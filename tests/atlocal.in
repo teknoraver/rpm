@@ -100,6 +100,19 @@ snapshot()
     esac
 }
 
+FSTYPE=$(stat -f -c %T /)
+REFLINKABLE_FS=("xfs" "brtfs")
+
+REFLINK_DISABLED=true;
+for item in "${REFLINKABLE_FS[@]}"
+do
+    if test "${FSTYPE}" = "${item}"
+    then
+	REFLINK_DISABLED=false;
+	break
+    fi
+done
+
 setup_env()
 {
     if [ -d tree ]; then
@@ -136,6 +149,14 @@ runroot()
              --define "_buildhost testhost" \
              --define "_topdir /build" \
              --nouserns
+}
+
+function runroot_plugins()
+{
+    setup_env
+    (unset RPM_CONFIGDIR RPM_POPTEXEC_PATH; cd ${RPMTEST} && \
+     MAGIC="/magic/magic" FAKECHROOT_BASE="${RPMTEST}" fakechroot "$@" --define "_buildhost testhost" --define "_topdir /build" --nouserns
+    )
 }
 
 runroot_other()

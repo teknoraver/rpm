@@ -1186,6 +1186,7 @@ Supplements:   (%{name} = %{version}-%{release} and langpacks-%{1})\
 
 # Transaction plugin macros
 %__plugindir		%{_libdir}/rpm-plugins
+%__transaction_reflink		%{__plugindir}/reflink.so
 %__transaction_systemd_inhibit	%{__plugindir}/systemd_inhibit.so
 %__transaction_selinux		%{__plugindir}/selinux.so
 %__transaction_syslog		%{__plugindir}/syslog.so

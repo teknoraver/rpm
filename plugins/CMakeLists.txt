@@ -1,5 +1,6 @@
 add_library(prioreset MODULE prioreset.c)
 add_library(syslog MODULE syslog.c)
+add_library(reflink MODULE reflink.c)
 
 if(WITH_SELINUX)
 	add_library(selinux MODULE selinux.c)
@@ -44,7 +45,6 @@ get_property(plugins DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 foreach(plugin ${plugins})
 	target_link_libraries(${plugin} PRIVATE librpmio librpm ${Intl_LIBRARIES})
 	# XX this is wrong, but required while rpmplugin.h is there
-	target_include_directories(${plugin} PRIVATE ${CMAKE_SOURCE_DIR}/lib ${Intl_INCLUDE_DIRS})
+	target_include_directories(${plugin} PRIVATE ${CMAKE_SOURCE_DIR}/lib ${CMAKE_SOURCE_DIR}/rpmio ${Intl_INCLUDE_DIRS})
 	install(TARGETS ${plugin} DESTINATION ${plugindir})
 endforeach()
-
