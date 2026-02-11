@@ -15,10 +15,10 @@ if(WITH_DBUS)
 	target_link_libraries(systemd_inhibit PRIVATE PkgConfig::DBUS)
 	add_library(dbus_announce MODULE dbus_announce.c)
 	target_link_libraries(dbus_announce PRIVATE PkgConfig::DBUS)
-	install(FILES
-	  org.rpm.conf
-	  DESTINATION ${DBUS_DATADIR}/dbus-1/system.d/
-	)
+#	install(FILES
+#	  org.rpm.conf
+#	  DESTINATION ${DBUS_DATADIR}/dbus-1/system.d/
+#	)
 endif()
 
 if(WITH_IMAEVM)
