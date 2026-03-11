@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <fcntl.h>
 #if defined(__linux__)
 #include <linux/fs.h>        /* For FICLONE */
@@ -43,7 +44,6 @@
 
 struct reflink_state_s {
     /* Stuff that's used across rpms */
-    long fundamental_block_size;
     char *buffer;
 
     /* stuff that's used/updated per psm */
@@ -117,13 +117,6 @@ static unsigned int inodeId(rpm_ino_t a)
 static rpmRC reflink_init(rpmPlugin plugin, rpmts ts) {
     reflink_state state = rcalloc(1, sizeof(struct reflink_state_s));
 
-    /* IOCTL-FICLONERANGE(2): ...Disk filesystems generally require the offset
-     * and length arguments to be aligned to the fundamental block size.
-     *
-     * The value of "fundamental block size" is directly related to the
-     * system's page size, so we should use that.
-     */
-    state->fundamental_block_size = sysconf(_SC_PAGESIZE);
     state->buffer = rcalloc(1, BUFFER_SIZE);
     rpmPluginSetData(plugin, state);
 
@@ -310,15 +303,34 @@ static rpmRC reflink_fsm_file_install(rpmPlugin plugin, rpmfi fi, const char* pa
 	}
 	size = rpmfiFSize(fi);
 	if (size > 0) {
+	    unsigned long fundamental_block_size;
+	    struct statfs sfs;
+
+	    fcr.src_fd = Fileno(state->fd);
+
+	    if (fstatfs(fcr.src_fd, &sfs) == 0) {
+		/* IOCTL-FICLONERANGE(2): ...Disk filesystems generally require the offset
+		 * and length arguments to be aligned to the fundamental block size.
+		 *
+		 * The value of "fundamental block size" is directly related to the
+		 * filesystem block size, so we should use that.
+		 */
+		fundamental_block_size = sfs.f_bsize;
+	    } else {
+		close(dst);
+		rpmlog(RPMLOG_ERR,
+		       _("reflink: unable to get filesystem block size for %s: %s\n"),
+		       rpmfiFN(fi), strerror(errno));
+		return RPMRC_FAIL;
+	    }
 	    /* round src_length down to fundamental_block_size multiple */
-	    fcr.src_length = size / state->fundamental_block_size * state->fundamental_block_size;
-	    if ((size % state->fundamental_block_size) > 0) {
+	    fcr.src_length = size / fundamental_block_size * fundamental_block_size;
+	    if ((size % fundamental_block_size) > 0) {
 		/* round up to next fundamental_block_size. We expect the data
 		 * in the rpm to be similarly padded.
 		 */
-		fcr.src_length += state->fundamental_block_size;
+		fcr.src_length += fundamental_block_size;
 	    }
-	    fcr.src_fd = Fileno(state->fd);
 	    if (fcr.src_fd == -1) {
 		close(dst);
 		rpmlog(RPMLOG_ERR, _("reflink: src fd lookup failed\n"));
