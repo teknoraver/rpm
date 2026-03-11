@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/vfs.h>
 #include <signal.h>
 #include <errno.h>
 #include <string.h>
@@ -270,7 +271,8 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
     FD_t fdo;
     FD_t gzdi;
     Header h, sigh;
-    long fundamental_block_size = sysconf(_SC_PAGESIZE);
+    unsigned long fundamental_block_size;
+    struct statfs sfs;
     rpmRC rc = RPMRC_OK;
     rpm_mode_t mode;
     char *rpmio_flags = NULL, *zeros;
@@ -287,6 +289,14 @@ static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
     digestSet ds = NULL;
 
     fdo = fdDup(STDOUT_FILENO);
+
+    if (fstatfs(STDOUT_FILENO, &sfs) == 0) {
+	fundamental_block_size = sfs.f_bsize;
+    } else {
+	rpmlog(RPMLOG_ERR, _("Unable to stat output filesystem: %d, %s\n"),
+	       errno, strerror(errno));
+	exit(EXIT_FAILURE);
+    }
 
     rc = rpmLeadReadAndReturn(fdi, &msg, &l);
     if (rc != RPMRC_OK)
