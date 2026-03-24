@@ -248,7 +248,7 @@ s:%lang(C) ::
 find "$TOP_DIR" -type d|sed '
 s:'"$TOP_DIR"'::
 '"$ALL_NAME$MAN"'s:\(.*/man/\([^/_]\+\).*/man[a-z0-9]\+/\)::
-'"$ALL_NAME$MAN"'s:\(.*/man/\([^/_]\+\).*/man[a-z0-9]\+$\):%lang(\2) \1*:
+'"$ALL_NAME$MAN"'s:\(.*/man/\([^/_]\+\).*/man[a-z0-9]\+$\):%lang(\2) \1/*:
 s:^\([^%].*\)::
 s:%lang(C) ::
 /^$/d' >> $MO_NAME
