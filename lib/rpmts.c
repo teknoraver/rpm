@@ -482,6 +482,8 @@ static int makePubkeyHeader(rpmts ts, rpmPubkey key, rpmPubkey *subkeys,
     int rc = -1;
     int i;
 
+    memset(&kd, 0, sizeof(kd));
+
     if ((enc = rpmPubkeyBase64(key)) == NULL)
 	goto exit;
     if ((dig = rpmPubkeyDig(key)) == NULL)
