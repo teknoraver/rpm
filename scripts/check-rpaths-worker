@@ -120,13 +120,13 @@ for i; do
 	        (/lib64/*|/usr/lib64/*|/usr/X11R6/lib64/*|/usr/local/lib64/*)
 		    badness=0;;
 
-		(\$ORIGIN|\${ORIGINX}|\$ORIGIN/*|\${ORIGINX}/*)
+		(\$ORIGIN|\$\{ORIGINX\}|\$ORIGIN/*|\$\{ORIGINX\}/*)
 		    test $allow_ORIGIN -eq 0 && badness=8 || {
 			badness=0
 			new_allow_ORIGIN=1
 		    }
 		    ;;
-		(/*\$PLATFORM*|/*\${PLATFORM}*|/*\$LIB*|/*\${LIB}*)
+		(/*\$PLATFORM*|/*\$\{PLATFORM\}*|/*\$LIB*|/*\$\{LIB\}*)
 		    badness=0;;
 	    	
 	        (/lib|/usr/lib|/usr/X11R6/lib)
