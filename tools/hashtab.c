@@ -292,7 +292,8 @@ htab_expand (htab)
     }
   while (p < olimit);
 
-  free (oentries);
+  if (oentries != htab->entries)
+    free(oentries);
   return 1;
 }
 
