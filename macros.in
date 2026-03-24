@@ -824,6 +824,8 @@ package or when debugging this package.\
   export CLASSPATH}\
   PKG_CONFIG_PATH=\"${PKG_CONFIG_PATH}:%{_libdir}/pkgconfig:%{_datadir}/pkgconfig\"\
   export PKG_CONFIG_PATH\
+  CONFIG_SITE=${CONFIG_SITE:-NONE}\
+  export CONFIG_SITE\
   \
   %{verbose:set -x}\
   umask 022\
