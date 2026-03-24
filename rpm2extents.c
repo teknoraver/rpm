@@ -248,26 +248,26 @@ static void sanitizeSignatureHeader(Header * sigh)
     rpmtdFreeData(&td);
 }
 
+static uint32_t diglen;
+/* GNU C extension: can use diglen from outer context */
+int digestSetCmp(const unsigned char * a, const unsigned char * b) {
+    return memcmp(a, b, diglen);
+}
+
+unsigned int digestSetHash(const unsigned char * digest) {
+    /* assumes sizeof(unsigned int) < diglen */
+    return *(unsigned int *)digest;
+}
+
+int digestoffsetCmp(const void * a, const void * b) {
+    return digestSetCmp(
+	((struct digestoffset *)a)->digest,
+        ((struct digestoffset *)b)->digest
+    );
+}
+
 static rpmRC process_package(FD_t fdi, FD_t digestori, FD_t validationi)
 {
-    uint32_t diglen;
-    /* GNU C extension: can use diglen from outer context */
-    int digestSetCmp(const unsigned char * a, const unsigned char * b) {
-	return memcmp(a, b, diglen);
-    }
-
-    unsigned int digestSetHash(const unsigned char * digest) {
-        /* assumes sizeof(unsigned int) < diglen */
-        return *(unsigned int *)digest;
-    }
-
-    int digestoffsetCmp(const void * a, const void * b) {
-	return digestSetCmp(
-	    ((struct digestoffset *)a)->digest,
-	    ((struct digestoffset *)b)->digest
-	);
-    }
-
     FD_t fdo;
     FD_t gzdi;
     Header h, sigh;
