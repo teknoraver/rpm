@@ -94,7 +94,12 @@ int main(int argc, char *argv[])
 	exit(EXIT_FAILURE);
     }
 
-    rc = (ufdCopy(gzdi, fdo) == payload_size) ? EXIT_SUCCESS : EXIT_FAILURE;
+    /*
+     * XXX HACK for #1142949: should be equality test, but archive size
+     * short by cpio trailer size in packages built with rpm 4.12.0
+     * and its pre-releases.
+     */
+    rc = (ufdCopy(gzdi, fdo) >= payload_size) ? EXIT_SUCCESS : EXIT_FAILURE;
 
     Fclose(fdo);
 
