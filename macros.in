@@ -145,6 +145,9 @@
 #	A spec file can %%define _find_debuginfo_opts to pass options to
 #	the script.  See the script for details.
 #
+#	Vendor spec files (eg redhat-rpm-config:macros) can %%define
+#       _find_debuginfo_vendor_opts to pass options to the script.
+#
 %__debug_install_post   \
     %{_rpmconfigdir}/find-debuginfo.sh \\\
     %{?_smp_build_ncpus:-j%{_smp_build_ncpus}} \\\
@@ -157,6 +160,7 @@
     %{?_unique_debug_srcs:--unique-debug-src-base "%{name}-%{VERSION}-%{RELEASE}.%{_arch}"} \\\
     %{?_find_debuginfo_dwz_opts} \\\
     %{?_find_debuginfo_opts} \\\
+    %{?_find_debuginfo_vendor_opts} \\\
     %{?_debugsource_packages:-S debugsourcefiles.list} \\\
     "%{_builddir}/%{?buildsubdir}"\
 %{nil}
