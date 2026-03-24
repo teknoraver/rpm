@@ -43,6 +43,12 @@ ima_la_LIBADD = $(top_builddir)/lib/librpm.la $(top_builddir)/rpmio/librpmio.la
 plugins_LTLIBRARIES += ima.la
 endif
 
+if FAPOLICYD
+fapolicyd_la_sources = fapolicyd.c
+fapolicyd_la_LIBADD = $(top_builddir)/lib/librpm.la $(top_builddir)/rpmio/librpmio.la
+plugins_LTLIBRARIES += fapolicyd.la
+endif
+
 if AUDIT
 audit_la_sources = audit.c
 audit_la_LIBADD = $(top_builddir)/lib/librpm.la $(top_builddir)/rpmio/librpmio.la @WITH_AUDIT_LIB@
